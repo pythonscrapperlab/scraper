@@ -1,0 +1,49 @@
+# Core Framework & Server
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.6
+pydantic==2.10.0
+pydantic-settings==2.6.0
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.31.0
+alembic==1.14.0
+
+# Scraping & HTTP
+playwright==1.48.0
+selenium==4.25.0
+httpx==0.28.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
+tenacity==8.3.0
+
+# Scheduling
+apscheduler==3.10.4
+celery==5.4.0  # for future distributed setup
+redis==5.2.0
+
+# Proxies (optional)
+brightdata
+
+# Utilities
+click==8.1.8
+python-dotenv==1.0.1
+requests==2.32.3
+
+# Logging & Monitoring
+python-json-logger==3.2.1
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+
+# Code Quality
+black==24.10.0
+ruff==0.8.2
+mypy==1.14.1
+isort==5.13.2
+
+# Development
+ipython==8.31.0
