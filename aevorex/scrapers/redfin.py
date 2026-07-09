@@ -37,7 +37,7 @@ class RedfinScraper(BaseScraper):
             if self.proxy_manager.user and self.proxy_manager.password:
                 self.proxy_manager.enabled = True
 
-        self.base_filters = "/filter/sort=lo-days,property-type=house+condo+townhouse+multifamily,max-year-built=2024,max-days-on-market=4mo,include=forsale+mlsfsbo+fsbo,exclude-short-sale,exclude-age-restricted,exclude-land-lease/page-[PAGE]"
+        self.base_filters = "/filter/sort=lo-days,property-type=house+condo+townhouse+multifamily,max-year-built=2024,max-days-on-market=2mo,include=forsale+mlsfsbo+fsbo,exclude-short-sale,exclude-age-restricted,exclude-land-lease/page-[PAGE]"
 
     def _new_client(self) -> HttpClient:
         """Create an HttpClient bound to webshare's rotating gateway (or no proxy)."""
