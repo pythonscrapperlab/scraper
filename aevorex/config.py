@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     # === Database ===
     db_host: str = "localhost"
     db_port: int = 5432
-    db_name: str = "aevorex"
+    db_name: str = "aevorex_db"
     db_user: str = "aevorex"
-    db_password: str = "aevorex_password"
+    db_password: str = "aevorex123!"
     db_echo: bool = False  # Log SQL queries
     db_pool_size: int = 20
     db_max_overflow: int = 10

@@ -8,23 +8,50 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aevorex.db.models import Property
 
+# Fields on the normalized-data dict that live in satellite tables, not as
+# plain columns on Property. Never setattr these directly onto a Property
+# instance. Populating the satellite tables themselves (schools, comps,
+# POIs, transport stops, location score, features, price/tax history,
+# images, open houses) is a separate step the caller does after upsert(),
+# using the returned property_obj.id.
+SATELLITE_KEYS = (
+    "price_history",
+    "tax_history",
+    "property_images",
+    "open_houses",
+    "schools",
+    "comps",
+    "pois",
+    "transport_stops",
+    "location_score",
+    "features",
+    "market_snapshot",  # zip-level, not tied to this one property at all
+)
+
 
 class Deduplicator:
     """
     Handles matching, merging, and upserting properties.
-    
+
     Strategy:
-    1. Try to match by platform ID (zillow_id, redfin_id, realtor_id)
-    2. If no match, try normalized address + zip
-    3. If no match, insert new property
-    4. If match found, update with new data and recalculate variance
+    1. Try to match by platform ID (zillow_id, redfin_id, realtor_id) —
+       cheapest, exact, catches rescrapes of a listing you already have
+       from this same source.
+    2. If no match, try APN (Assessor Parcel Number), scoped to state —
+       the strongest cross-source signal, since it identifies the
+       physical parcel rather than a formatted address string. Not every
+       source reliably exposes it, so this only fires when present.
+    3. If no match, try normalized address + zip (fallback for when APN
+       is missing).
+    4. If no match, insert new property.
+    5. If match found, update with new data and recalculate variance.
     """
 
     @staticmethod
     def normalize_address(address: str) -> str:
         """
         Normalize address for deduplication.
-        
+
         - Lowercase
         - Remove extra whitespace
         - Remove common suffixes (#, Apt, Suite, etc.)
@@ -51,17 +78,32 @@ class Deduplicator:
         return digits[:5]
 
     @staticmethod
+    def normalize_apn(apn: str) -> str:
+        """
+        Normalize APN for matching.
+
+        Sources format the same parcel number differently (dashes, spaces,
+        leading zeros) — e.g. "28-22-24-7566-02-130" vs "282224756602130".
+        Strip everything but alphanumerics and uppercase, so the same
+        physical parcel always normalizes to the same string regardless
+        of source formatting.
+        """
+        if not apn:
+            return ""
+        return re.sub(r'[^A-Za-z0-9]', '', apn).upper()
+
+    @staticmethod
     async def find_by_platform_id(
         session: AsyncSession, source: str, external_id: str
     ) -> Optional[Property]:
         """
         Find property by platform ID.
-        
+
         Args:
             session: Async database session
             source: Platform (zillow | redfin | realtor)
             external_id: Platform's property ID
-            
+
         Returns:
             Property or None
         """
@@ -83,17 +125,51 @@ class Deduplicator:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def find_by_apn(
+        session: AsyncSession, apn: str, state: Optional[str] = None
+    ) -> Optional[Property]:
+        """
+        Find property by normalized APN (Assessor Parcel Number).
+
+        APN is stored pre-normalized on Property, so this is a plain
+        indexed equality lookup, not a client-side scan. APN formats
+        aren't guaranteed unique nationwide (only within an assessor's
+        jurisdiction), so scope by state as a cheap safety net against a
+        coincidental collision between two different counties/states.
+
+        Args:
+            session: Async database session
+            apn: Raw or normalized APN (will be normalized here regardless)
+            state: 2-letter state code to scope the match, if known
+
+        Returns:
+            Property or None
+        """
+        norm_apn = Deduplicator.normalize_apn(apn)
+        if not norm_apn:
+            return None
+
+        from sqlalchemy import select
+
+        query = select(Property).where(Property.apn == norm_apn)
+        if state:
+            query = query.where(Property.state == state)
+
+        result = await session.execute(query)
+        return result.scalars().first()
+
+    @staticmethod
     async def find_by_address(
         session: AsyncSession, address: str, zip_code: str
     ) -> Optional[Property]:
         """
         Find property by normalized address + zip.
-        
+
         Args:
             session: Async database session
             address: Street address
             zip_code: Zip code
-            
+
         Returns:
             Property or None
         """
@@ -126,22 +202,27 @@ class Deduplicator:
         session: AsyncSession,
         source: str,
         external_id: Optional[str],
+        apn: Optional[str],
         address: Optional[str],
         zip_code: Optional[str],
+        state: Optional[str] = None,
     ) -> Optional[Property]:
         """
         Find existing property using multi-step strategy.
-        
+
         1. Try platform ID match
-        2. Try address + zip match
-        
+        2. Try APN match
+        3. Try address + zip match
+
         Args:
             session: Async database session
             source: Platform
             external_id: Platform property ID (optional)
+            apn: Assessor Parcel Number (optional)
             address: Street address (optional)
             zip_code: Zip code (optional)
-            
+            state: 2-letter state code, used to scope the APN match (optional)
+
         Returns:
             Matching Property or None
         """
@@ -151,7 +232,13 @@ class Deduplicator:
             if existing:
                 return existing
 
-        # Step 2: Try address + zip
+        # Step 2: Try APN
+        if apn:
+            existing = await Deduplicator.find_by_apn(session, apn, state)
+            if existing:
+                return existing
+
+        # Step 3: Try address + zip
         if address and zip_code:
             existing = await Deduplicator.find_by_address(session, address, zip_code)
             if existing:
@@ -163,7 +250,7 @@ class Deduplicator:
     def calculate_price_variance(prices: list) -> float:
         """
         Calculate price variance percentage.
-        
+
         Returns: max(prices) / min(prices) * 100 - 100 (percent difference)
         """
         if len(prices) < 2:
@@ -186,22 +273,29 @@ class Deduplicator:
     ) -> Tuple[Property, bool]:
         """
         Insert or update property, returning (property, is_new).
-        
+
         Args:
             session: Async database session
             source: Platform (zillow | redfin | realtor)
             normalized_data: Normalized property dict from normalizer
-            
+
         Returns:
             (Property object, is_new: bool) where is_new=True if inserted
         """
+        # Normalize APN up front so both matching and storage use the same
+        # canonical form, regardless of how this source formatted it.
+        if normalized_data.get("apn"):
+            normalized_data["apn"] = Deduplicator.normalize_apn(normalized_data["apn"])
+
         external_id = normalized_data.get(f"{source}_id")
+        apn = normalized_data.get("apn")
         address = normalized_data.get("address")
         zip_code = normalized_data.get("zip_code")
+        state = normalized_data.get("state")
 
         # Try to find existing
         existing = await Deduplicator.find_existing(
-            session, source, external_id, address, zip_code
+            session, source, external_id, apn, address, zip_code, state
         )
 
         if existing:
@@ -219,7 +313,7 @@ class Deduplicator:
             # Update fields (prefer non-None new values)
             for key, value in normalized_data.items():
                 if value is not None and key not in ("zillow_id", "redfin_id", "realtor_id"):
-                    if key not in ("price_history", "tax_history", "property_images", "open_houses"):
+                    if key not in SATELLITE_KEYS:
                         setattr(existing, key, value)
 
             # Recalculate price variance
@@ -243,7 +337,7 @@ class Deduplicator:
             # Remove satellite/computed fields from dict to pass to Property
             data_for_property = {
                 k: v for k, v in normalized_data.items()
-                if k not in ("price_history", "tax_history", "property_images", "open_houses", "primary_source")
+                if k not in SATELLITE_KEYS and k != "primary_source"
             }
 
             property_obj = Property(
@@ -268,7 +362,7 @@ class Deduplicator:
     def _pick_primary_source(source: str) -> str:
         """
         Pick primary source based on priority.
-        
+
         Priority: Realtor > Redfin > Zillow
         """
         priority = {"realtor": 3, "redfin": 2, "zillow": 1}

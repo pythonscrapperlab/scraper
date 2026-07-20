@@ -23,8 +23,8 @@ REDFIN = {
     }
 }
 
-REDFIN = {
-    "FL": {
-        "Orlando": 13655,
-    }
-}
+# REDFIN = {
+#     "FL": {
+#         "Orlando": 13655,
+#     }
+# }

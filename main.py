@@ -52,9 +52,14 @@ def scrape(source: str, state: tuple):
 
     logger.info(f"Starting scrape: sources={sources}, states={states}")
 
-    for src in sources:
-        for st in states:
-            asyncio.run(_scrape_single(src, st))
+    asyncio.run(_scrape_many(sources, states))
+
+
+async def _scrape_many(sources: list[str], states: list[str]) -> None:
+    """Run all requested scrapes within a single event loop."""
+    for source in sources:
+        for state in states:
+            await _scrape_single(source, state)
 
 
 async def _scrape_single(source: str, state: str) -> None:
@@ -197,7 +202,4 @@ def init_db():
 
 
 if __name__ == "__main__":
-    try:
-        cli()
-    finally:
-        asyncio.run(close_engine())
+    cli()
