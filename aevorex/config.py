@@ -47,8 +47,8 @@ class Settings(BaseSettings):
     # === Transport: Proxies ===
     proxy_enabled: bool = True  # Disabled by default
     proxy_provider: str = "webshare"  # brightdata | oxylabs | smartproxy | webshare
-    proxy_user: Optional[str] = "zoroupwork-US-rotate"
-    proxy_password: Optional[str] = "burhanburhan"
+    proxy_user: Optional[str] = "fdaiyhom-US-rotate"
+    proxy_password: Optional[str] = "z05145t04aqm"
     proxy_zone: Optional[str] = "US"
 
     # === Scraping: Zillow ===

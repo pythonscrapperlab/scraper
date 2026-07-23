@@ -77,7 +77,7 @@ class RedfinScraper(BaseScraper):
         return urls
 
     def _parse_homecards(self, html: str) -> List[str]:
-        soup = BeautifulSoup(html, "html.parser")  # type: ignore
+        soup = BeautifulSoup(html, "lxml")  # type: ignore
         return [
             self.base_url + a["href"]
             for a in soup.findAll("a", {"class": "bp-Homecard__Address"})
@@ -104,7 +104,7 @@ class RedfinScraper(BaseScraper):
         try:
             first_page_url = f"{url}{self.base_filters}".replace("[PAGE]", "1")
             res = await client.get_text(first_page_url)
-            soup = BeautifulSoup(res, "html.parser")  # type: ignore
+            soup = BeautifulSoup(res, "lxml")  # type: ignore
 
             property_urls = [
                 self.base_url + a["href"]
@@ -188,7 +188,6 @@ class RedfinScraper(BaseScraper):
             'sec-fetch-user': '?1',
             'upgrade-insecure-requests': '1',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-            # 'cookie': 'audS=t; RF_BROWSER_ID=LjpxpadgSbSfRUss4x0UZw; _gcl_au=1.1.2074126290.1779548393; _gcl_gs=2.1.k1$i1779548378$u222895640; __pdst=4652dbe40c2b44dfb9419d0871c94e4b; _scor_uid=2a51d40227df49428f440f9626fc71ed; _fbp=fb.1.1779548410268.167752959475102619; _tt_enable_cookie=1; _ttp=01KSANKN4MZ6FFN9X2G7PG6G6N_.tt.1; _gac_UA-294985-1=1.1779548494.Cj0KCQjwoMXQBhDcARIsAH-eEtvuMjKwM29LWzCo_8mG0_bvG4JkbPhNjmH_38s70z_0r9f0QY_7a68aAhnDEALw_wcB; RF_BROWSER_CAPABILITIES=%7B%22screen-size%22%3A4%2C%22events-touch%22%3Afalse%2C%22ios-app-store%22%3Afalse%2C%22google-play-store%22%3Afalse%2C%22ios-web-view%22%3Afalse%2C%22android-web-view%22%3Afalse%7D; OptanonAlertBoxClosed=2026-05-23T15:01:49.458Z; _gcl_aw=GCL.1779548528.Cj0KCQjwoMXQBhDcARIsAH-eEtvuMjKwM29LWzCo_8mG0_bvG4JkbPhNjmH_38s70z_0r9f0QY_7a68aAhnDEALw_wcB; cw-test-00000000_ppid-hem_10_90=control; cw-test-20250807_uid-2-test_95_2.5_2.5=enabled@sha256_absent; cw-test-20250415_req-v9_10_90=test; cw-test-00000000_stand-alone-floors-facade-hardFloor_25_25_25_25=falla; cw-test-00000000_stand-alone-floors-facade-multiplier_10_80_10_0=multb; cw-test-20250609_floormachine-test_50_50=test; cw-test-20250529_viewable-refresh_5_95=control; cw-test-20250220_viewability-test_100_0=test; cw-test-00000000_stand-alone-floors-comparison-multiplier_0_100=control; _lr_env_src_ats=false; RF_BUSINESS_MARKET=87; RF_BID_UPDATED=1; tatari-session-cookie=5b4752e3-4dae-aaba-b424-07b6cdd35892; cw-test-20260604_gpt-setconfig-init_75_25=new; SA_FLYOUT_VIEWS=2; SA_FLYOUT_CLOSED=true; searchMode=1; ttcsid_CBK31DRC77UFMFRPS1P0=1781102096620::08xCHCqKiQg52fb9XjLr.1.1781102106638.1; save_search_nudge_flyout=2%251781102184869%25false; RF_MARKET=centralflorida; sortOrder=1; sortOption=time_on_market; _gid=GA1.2.1657440988.1781299982; displayMode=0; segmentedControlMode=0; RF_MARKET=centralflorida; RF_VISITED=true; unifiedLastSearch=name%3DOrlando%26subName%3DOrlando%252C%2520FL%252C%2520USA%26url%3D%252Fcity%252F13655%252FFL%252FOrlando%26id%3D2_13655%26type%3D2%26unifiedSearchType%3D2%26isSavedSearch%3D%26countryCode%3DUS; RF_LAST_NAV=0; userPreferences=parcels%3Dtrue%26schools%3Dfalse%26mapStyle%3Ds%26statistics%3Dtrue%26agcTooltip%3Dfalse%26agentReset%3Dfalse%26ldpRegister%3Dfalse%26afCard%3D2%26schoolType%3D0%26lastSeenLdp%3DnoSharedSearchCookie%26viewedSwipeableHomeCardsDate%3D1781341562505; g_state={"i_l":0,"i_ll":1781341564658,"i_b":"TTtz49jrntewWoLgWJSPhih2iSRchESxMwQBdn4/hiw","i_e":{"enable_itp_optimization":0},"i_et":1779548495760}; __gads=ID=ec0f7bde7d4ddbb3:T=1779548597:RT=1781341567:S=ALNI_MYNCJCgJ9ScyvNUfAKRAjzNOuhgNQ; __gpi=UID=000013fa3270a969:T=1779548597:RT=1781341567:S=ALNI_MZ9plq1Cy_MbmHJtF8mlMTxpf9Z9A; __eoi=ID=cbb5610a5c0fe970:T=1779548597:RT=1781341567:S=AA-AfjZBt691zhylRvFTLlWMi3Vb; RF_CORVAIR_LAST_VERSION=vLATEST; RF_TRAFFIC_SEGMENT=non-organic; OptanonConsent=isGpcEnabled=0&datestamp=Sat+Jun+13+2026+18%3A16%3A17+GMT%2B0500+(Pakistan+Standard+Time)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=fa6e5762-fb97-4db0-9788-1ad3b364311d&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CSPD_BG%3A1%2CC0002%3A1%2CC0004%3A1&crTime=1779548508402&AwaitingReconsent=false&geolocation=PK%3BPB; _ga_KWDGQ0PKNE=GS2.1.s1781356585$o7$g0$t1781356585$j60$l0$h307873781; AMP_TOKEN=%24NOT_FOUND; _ga=GA1.2.871911967.1779548402; tatari-cookie-test=73313163; FEED_COUNT=%5B%22%22%2C%22f%22%5D; PageCount=2; RF_LISTING_VIEWS=216843465.192914122.187171757.216832253.216681112.215950798; RF_LAST_DP_SERVICE_REGION=997; _uetsid=46fc53d066a611f19fd43d0ac2211ac8|c88ugg|2|g6v|0|2354; RF_LDP_VIEWS_FOR_PROMPT=%7B%22viewsData%22%3A%7B%2206-10-2026%22%3A%7B%22216681112%22%3A1%7D%2C%2206-13-2026%22%3A%7B%22187171757%22%3A1%2C%22192914122%22%3A1%2C%22216832253%22%3A1%2C%22216843465%22%3A1%7D%7D%2C%22expiration%22%3A%222028-05-22T15%3A06%3A24.874Z%22%2C%22totalPromptedLdps%22%3A0%7D; _ga_928P0PZ00X=GS2.1.s1781356578$o7$g0$t1781356602$j36$l0$h0; _uetvid=49f7f8b056b811f187143b40467446de|eqiwvb|1781356603919|1|1|bat.bing.com/p/conversions/c/e; ttcsid_C95K9BJC77U9N0P94330=1781356598632::sUn16u4KD4fo9ePm8c5T.6.1781356613132.1; aws-waf-token=97cad1d1-d183-46d1-901b-4c153dd82626:BQoAuRxcKPgaAAAA:UE9KbTNgiXqts5QtC4tBK8mRPO2pHAbfmPqk/lys7b29jozPMxD/XgG7VC3fVVDqMDLmSaHZjJ2pBn5ncfkStL6r0zvcDbsS2uoBTdOiM7LMRsKLDHy8/3BlF+Pexiq96AKb6mFMR4VUW2jf4bcovwcBEBNCHWjh6PaYeo4Em+HVCFL1Uke6B9DoN2BYJjxKGFYNekNcB1YNuYPocSyhFp7I+bYtq3ZIZxtZdwsmD0jD/8zaFmXOolNYOqlZ2yvchSh85h5hIU4u; ttcsid=1781356598635::yGBYtfq81RkWU2w75jIf.6.1781356613130.0::1.-34692.0::181415.1.171.1313::262049.80.190; _dd_s=logs=1&id=324ac681-bd2c-4beb-8e46-6016bcd11d8a&created=1781356592594&expire=1781357761060&rum=2',
         }
         client = self._new_client()
         try:
@@ -212,10 +211,10 @@ class RedfinScraper(BaseScraper):
         Returns:
             Dict with property fields
         """
-        # raise NotImplementedError("Redfin parsing not implemented yet.")
-        soup = BeautifulSoup(raw, 'html.parser')
-        # print(soup.prettify())
-        # print([i for i in soup.findAll("script", {"type":"application/ld+json"})])
+        # lxml is a C-based parser and meaningfully faster than html.parser on
+        # pages this large — Redfin's property pages run several hundred KB
+        # to a few MB with all the embedded scripts/JSON.
+        soup = BeautifulSoup(raw, 'lxml')
         try:
             script = [i for i in soup.findAll("script", {"type":"application/ld+json"}) if "RealEstateListing" in i.text][0]
             data = json.loads(script.text)
@@ -285,8 +284,14 @@ class RedfinScraper(BaseScraper):
             "monthly_payment": self.parse_price(monthly_payment.text) if monthly_payment else "",
             "property_images": property_images,
         }
-        # return extract_redfin_data(str(soup))
-        property_data = property_data | await self.extract_redfin_data(str(soup))
+        # Pass the ORIGINAL raw HTML, not a re-serialized str(soup). soup was
+        # only needed above for the JSON-LD script tag and the monthly-payment
+        # span; extract_redfin_data() below does nothing but a regex search
+        # over the page text, so rebuilding the whole DOM back into a string
+        # (str(soup), which walks and re-renders every node) was pure waste —
+        # on a page this size, that rebuild was almost certainly the single
+        # biggest cost in this function.
+        property_data = property_data | await self.extract_redfin_data(raw)
         
         return property_data
     
@@ -489,4 +494,3 @@ class RedfinScraper(BaseScraper):
         }
 
         return result
-

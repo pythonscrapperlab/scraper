@@ -15,11 +15,12 @@ property that had already succeeded. Each URL is now durable the moment
 it finishes.
 """
 
+import asyncio
 import json
 import logging
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,16 +68,25 @@ class PipelineRunner:
         result = await runner.run_scrape(session, state)
     """
 
-    def __init__(self, scraper: BaseScraper, normalizer: BaseNormalizer):
+    def __init__(self, scraper: BaseScraper, normalizer: BaseNormalizer, max_concurrent_fetches: int = 6):
         """
         Initialize pipeline with scraper and normalizer.
 
         Args:
             scraper: Scraper instance (BaseScraper subclass)
             normalizer: Normalizer instance (BaseNormalizer subclass)
+            max_concurrent_fetches: how many property pages to fetch+parse at
+                once. This is the network-bound part (each fetch is a full
+                page load through the proxy), so it's the one worth
+                parallelizing — DB writes stay sequential regardless (see
+                run_scrape). Keep this conservative: too high risks tripping
+                Redfin's WAF (note the aws-waf-token cookie in fetch()'s
+                headers) or exhausting the proxy pool. Tune against however
+                many concurrent connections webshare's plan actually supports.
         """
         self.scraper = scraper
         self.normalizer = normalizer
+        self.max_concurrent_fetches = max_concurrent_fetches
 
         # scraper.platform has been observed returning the lowercased class
         # name (e.g. "redfinscraper") instead of the intended source label —
@@ -140,10 +150,18 @@ class PipelineRunner:
 
             result["stats"]["total_urls"] = len(urls)
 
-            # Step 2: Process each URL. Each URL commits its own work — see
-            # module docstring for why.
-            for url in urls:
-                await self._process_url(session, url, result)
+            # Step 2: fetch + parse every URL concurrently (bounded). This is
+            # the slow, network-bound part, and it's embarrassingly
+            # parallel — nothing here touches the DB yet, so there's no
+            # session-safety concern in doing many at once.
+            fetched = await self._fetch_and_parse_all(urls)
+
+            # Step 3: write to the DB one at a time. AsyncSession isn't safe
+            # for concurrent use from multiple coroutines, and this part was
+            # never the bottleneck anyway — a handful of INSERTs is fast
+            # compared to a full page fetch through a proxy.
+            for url, raw, parsed, fetch_error in fetched:
+                await self._process_url(session, url, raw, parsed, fetch_error, result)
 
         except Exception as e:
             result["stats"]["errors"] += 1
@@ -156,16 +174,46 @@ class PipelineRunner:
 
         return result
 
-    async def _process_url(self, session: AsyncSession, url: str, result: Dict[str, Any]) -> None:
-        """Run one URL through fetch → parse → normalize → upsert, each phase its own transaction."""
+    async def _fetch_and_parse_all(
+        self, urls: List[str]
+    ) -> List[Tuple[str, Optional[Any], Optional[dict], Optional[Exception]]]:
+        """
+        Fetch + parse every URL concurrently, bounded by max_concurrent_fetches.
 
-        # ---- Phase 1: fetch + parse + save raw payload ----
+        Returns one (url, raw, parsed, error) tuple per URL, in the same
+        order as `urls` — never raises itself, so one bad fetch doesn't
+        cancel the others via asyncio.gather's default fail-fast behavior.
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent_fetches)
+
+        async def fetch_one(url: str):
+            async with semaphore:
+                try:
+                    raw = await self.scraper.fetch(url)
+                    if raw is None:
+                        return url, None, None, RuntimeError("fetch() returned None")
+                    parsed = await self.scraper.parse(raw)
+                    return url, raw, parsed, None
+                except Exception as e:
+                    return url, None, None, e
+
+        return await asyncio.gather(*(fetch_one(url) for url in urls))
+
+    async def _process_url(
+        self,
+        session: AsyncSession,
+        url: str,
+        raw: Optional[Any],
+        parsed: Optional[dict],
+        fetch_error: Optional[Exception],
+        result: Dict[str, Any],
+    ) -> None:
+        """Take an already fetched+parsed URL through normalize → upsert, each phase its own transaction."""
+
+        # ---- Phase 1: save raw payload (fetch/parse already happened in _fetch_and_parse_all) ----
         try:
-            raw = await self.scraper.fetch(url)
-            if raw is None:
-                raise RuntimeError("fetch() returned None")
-
-            parsed = await self.scraper.parse(raw)
+            if fetch_error is not None:
+                raise fetch_error
 
             if parsed is None:
                 # Parsing failed. Keep a slice of the raw HTML so we can
@@ -255,7 +303,10 @@ class PipelineRunner:
                 url=url,
                 source=self.source,
                 error_type=type(e).__name__,
-                error_message=str(e),
+                # SQLAlchemy/asyncpg exceptions embed the full SQL + params in str(e),
+                # easily over the column's 1000-char cap — the full detail is still in
+                # `traceback` (Text, unbounded), so truncate just this field.
+                error_message=str(e)[:990],
                 traceback=traceback.format_exc(),
                 attempted_at=datetime.now(timezone.utc).replace(tzinfo=None),
             ))
