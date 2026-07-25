@@ -122,7 +122,12 @@ class Deduplicator:
             return None
 
         result = await session.execute(query)
-        return result.scalar_one_or_none()
+        # .first() not .scalar_one_or_none(): duplicate Property rows sharing
+        # the same redfin_id can exist from before the 'redfinscraper' vs
+        # 'redfin' source bug was fixed (each buggy run never matched its own
+        # earlier inserts). See the same fix in pipeline.py's satellite
+        # upserts for the full explanation.
+        return result.scalars().first()
 
     @staticmethod
     async def find_by_apn(
@@ -192,7 +197,7 @@ class Deduplicator:
 
         # Filter by normalized address
         for prop in candidates:
-            if Deduplicator.normalize_address(prop.address) == norm_addr:
+            if Deduplicator.normalize_address(prop.address) == norm_addr: # type: ignore
                 return prop
 
         return None
@@ -323,10 +328,10 @@ class Deduplicator:
             ]
             prices = [p for p in prices if p]
             if prices:
-                existing.price_variance = Deduplicator.calculate_price_variance(prices)
+                existing.price_variance = Deduplicator.calculate_price_variance(prices) # type: ignore
 
             # Increment source count
-            existing.source_count = min(existing.source_count + 1, 3)
+            existing.source_count = min(existing.source_count + 1, 3) # type: ignore
 
             property_obj = existing
 
@@ -348,11 +353,11 @@ class Deduplicator:
 
             # Set platform ID
             if source == "zillow":
-                property_obj.zillow_id = external_id
+                property_obj.zillow_id = external_id # type: ignore
             elif source == "redfin":
-                property_obj.redfin_id = external_id
+                property_obj.redfin_id = external_id # type: ignore
             elif source == "realtor":
-                property_obj.realtor_id = external_id
+                property_obj.realtor_id = external_id # type: ignore
 
         session.add(property_obj)
         await session.flush()  # Ensure ID is generated

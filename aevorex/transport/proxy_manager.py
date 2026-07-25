@@ -48,6 +48,8 @@ class ProxyManager:
             await self._init_smartproxy()
         elif self.provider == "webshare":
             await self._init_webshare()
+        elif self.provider == "dataimpulse":
+            await self._init_dataimpulse()
         
         self._initialized = True
 
@@ -95,6 +97,18 @@ class ProxyManager:
             f"p.webshare.io:80"
         )
         self.proxy_list = [proxy_url]
+        
+    async def _init_dataimpulse(self) -> None:
+            """Initialize Dataimpulse proxy list."""
+            if not self.user or not self.password:
+                raise ValueError("Dataimpulse requires user and password")
+    
+            proxy_url = (
+                f"http://{self.user}:{self.password}@"
+                f"gw.dataimpulse.com:823"
+            )
+            
+            self.proxy_list = [proxy_url]
 
     async def get_next_proxy(self) -> Optional[str]:
         """Get next proxy in rotation."""
@@ -103,7 +117,7 @@ class ProxyManager:
 
         if not self._initialized:
             await self.init_proxies()
-
+        
         if not self.proxy_list:
             return None
 
@@ -142,3 +156,15 @@ class ProxyManager:
         if not self.user or not self.password:
             return None
         return f"http://{self.user}:{self.password}@p.webshare.io:80"
+    
+    def get_rotating_proxy_url_dataimpulse(self) -> Optional[str]:
+        """
+        Return a single proxy URL for dataimpulse's rotating residential gateway.
+        Suitable for reuse across an entire HttpClient session — no per-request
+        rotation needed since the gateway itself rotates exit IPs.
+        """
+        if not self.enabled:
+            return None
+        if not self.user or not self.password:
+            return None
+        return f"http://{self.user}:{self.password}@gw.dataimpulse.com:823"

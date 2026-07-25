@@ -47,7 +47,7 @@ class RedfinScraper(BaseScraper):
 
     def _new_client(self) -> HttpClient:
         """Create an HttpClient bound to webshare's rotating gateway (or no proxy)."""
-        proxy = self.proxy_manager.get_rotating_proxy_url()
+        proxy = self.proxy_manager.get_rotating_proxy_url_dataimpulse()
         if proxy:
             return HttpClient(proxy=proxy)
         return HttpClient()
@@ -122,9 +122,9 @@ class RedfinScraper(BaseScraper):
             except Exception:
                 total_pages = 1
             
-            if total_pages >2:
+            if total_pages >30:
                 self.logger.warning(f"Redfin search {url} has {total_pages} pages, which exceeds the limit of 20. Only fetching the first 20 pages.")
-                total_pages = 2
+                total_pages = 30
             
             if total_pages < 2:
                 return property_urls

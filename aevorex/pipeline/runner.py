@@ -411,7 +411,12 @@ class PipelineRunner:
                     PriceHistory.price == price,
                 )
             )
-            if result.scalar_one_or_none():
+            # .first() not .scalar_one_or_none(): this only needs to know
+            # whether a match exists. Pre-existing duplicate rows from before
+            # this dedup check existed (e.g. runs recorded under the old
+            # 'redfinscraper' source bug) would make scalar_one_or_none()
+            # raise MultipleResultsFound instead of just confirming a match.
+            if result.scalars().first():
                 continue
             session.add(PriceHistory(
                 property_id=property_id,
@@ -434,7 +439,9 @@ class PipelineRunner:
                     TaxHistory.tax_year == tax_year,
                 )
             )
-            existing = result.scalar_one_or_none()
+            # .first() not .scalar_one_or_none() — see the note in
+            # _upsert_price_history on why scalar_one_or_none() is risky here.
+            existing = result.scalars().first()
             if existing:
                 # A county reassessment can revise a prior year's figures, so
                 # update in place rather than skip.
@@ -479,7 +486,9 @@ class PipelineRunner:
                 MarketSnapshot.snapshot_date == data.get("snapshot_date"),
             )
         )
-        existing = result.scalar_one_or_none()
+        # .first() not .scalar_one_or_none() — see the note in
+        # _upsert_price_history on why scalar_one_or_none() is risky here.
+        existing = result.scalars().first()
         valid_keys = {c.name for c in MarketSnapshot.__table__.columns} - {"id", "created_at"}
         payload = {k: v for k, v in data.items() if k in valid_keys}
 
