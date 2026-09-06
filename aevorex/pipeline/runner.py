@@ -262,7 +262,13 @@ class PipelineRunner:
             property_obj, is_new = await Deduplicator.upsert(session, self.source, normalized)
             property_obj.raw_scrape_id = raw_scrape.id
 
-            await self._upsert_satellites(session, property_obj, normalized)
+            satellites_changed = await self._upsert_satellites(session, property_obj, normalized)
+            if satellites_changed:
+                # Deduplicator.upsert() already flips this for changed Property
+                # scalar columns; this covers changes it can't see (comps,
+                # price/tax history, location_score, features — separate rows,
+                # not attributes on property_obj).
+                property_obj.needs_analysis = True
 
             await session.commit()
 
@@ -317,7 +323,7 @@ class PipelineRunner:
 
     async def _upsert_satellites(
         self, session: AsyncSession, property_obj: Property, normalized: dict
-    ) -> None:
+    ) -> bool:
         """
         Upsert every satellite table the normalizer can produce.
 
@@ -334,26 +340,54 @@ class PipelineRunner:
           point is to keep every distinct event over time.
         - 1:1 tables (location_score, features) and market_snapshot get a
           plain merge-or-insert keyed on their primary key.
+
+        Returns whether anything *scoring-relevant* actually changed, so
+        the caller can decide whether to re-flag needs_analysis. Only
+        comps/price_history/tax_history/location_score/features feed the
+        scorers — schools/pois/transport_stops/images/open_houses don't, so
+        those replacements are intentionally not tracked here. market_snapshot
+        is zip-level (shared across every property in that zip), so it's
+        deliberately excluded too: flipping every property in a zip on every
+        market refresh is a much bigger blast radius than "this listing
+        changed" (see the module docstring in aevorex/scoring/runner.py's
+        design notes) — a property only picks up fresher market context the
+        next time it itself is rescraped.
         """
         property_id = property_obj.id
         source = self.source
 
         await self._replace_rows(session, School, property_id, source, normalized.get("schools") or [])
-        await self._replace_rows(session, PropertyComp, property_id, source, normalized.get("comps") or [])
+        comps_changed = await self._replace_comps(session, property_id, source, normalized.get("comps") or [])
         await self._replace_rows(session, PointOfInterest, property_id, source, normalized.get("pois") or [])
         await self._replace_rows(session, TransportStop, property_id, source, normalized.get("transport_stops") or [])
         await self._replace_images(session, property_id, source, normalized.get("property_images") or [])
         await self._replace_open_houses(session, property_id, source, normalized.get("open_houses") or [])
 
-        await self._upsert_price_history(session, property_id, source, normalized.get("price_history") or [])
-        await self._upsert_tax_history(session, property_id, source, normalized.get("tax_history") or [])
+        price_history_changed = await self._upsert_price_history(
+            session, property_id, source, normalized.get("price_history") or []
+        )
+        tax_history_changed = await self._upsert_tax_history(
+            session, property_id, source, normalized.get("tax_history") or []
+        )
 
-        await self._upsert_one_to_one(session, LocationScore, property_id, normalized.get("location_score"))
-        await self._upsert_one_to_one(session, PropertyFeature, property_id, normalized.get("features"))
+        location_score_changed = await self._upsert_one_to_one(
+            session, LocationScore, property_id, normalized.get("location_score")
+        )
+        features_changed = await self._upsert_one_to_one(
+            session, PropertyFeature, property_id, normalized.get("features")
+        )
 
         await self._upsert_market_snapshot(session, normalized.get("market_snapshot"))
 
         await session.flush()
+
+        return any([
+            comps_changed,
+            price_history_changed,
+            tax_history_changed,
+            location_score_changed,
+            features_changed,
+        ])
 
     # ------------------------------------------------------------------
     # "current state" tables: replace this property+source's rows wholesale
@@ -368,6 +402,30 @@ class PipelineRunner:
             if not entry:
                 continue
             session.add(model(property_id=property_id, **entry))
+
+    # comps feed the fix-and-flip scorer's ARV estimate, so — unlike
+    # schools/pois/transport_stops — this replace is fingerprinted against
+    # what's being deleted so the caller can tell "the comp set actually
+    # changed" from "identical comps rescraped again."
+    _COMP_FINGERPRINT_FIELDS = ("comp_address", "price", "bedrooms", "bathrooms", "sqft")
+
+    @classmethod
+    async def _replace_comps(cls, session: AsyncSession, property_id, source: str, entries: list) -> bool:
+        existing_result = await session.execute(
+            select(PropertyComp).where(PropertyComp.property_id == property_id, PropertyComp.source == source)
+        )
+        existing_fingerprint = {
+            tuple(getattr(row, f) for f in cls._COMP_FINGERPRINT_FIELDS)
+            for row in existing_result.scalars().all()
+        }
+        new_fingerprint = {
+            tuple(entry.get(f) for f in cls._COMP_FINGERPRINT_FIELDS)
+            for entry in entries
+            if entry
+        }
+
+        await cls._replace_rows(session, PropertyComp, property_id, source, entries)
+        return existing_fingerprint != new_fingerprint
 
     @staticmethod
     async def _replace_images(session: AsyncSession, property_id, source: str, image_urls: list) -> None:
@@ -397,18 +455,66 @@ class PipelineRunner:
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def _upsert_price_history(session: AsyncSession, property_id, source: str, entries: list) -> None:
+    async def _upsert_price_history(session: AsyncSession, property_id, source: str, entries: list) -> bool:
+        """
+        Insert any event this property doesn't already have from this source.
+
+        Two things to know about the matching key here:
+
+        - `price` may legitimately be NULL (Listing Removed / Pending /
+          Relisted / Contingent / Delisted never carry one), so it's compared
+          with IS NOT DISTINCT FROM. A plain `== price` comparison is NULL
+          against NULL, which is NULL, which is not true — every unpriced
+          event would look new on every single rescrape and the table would
+          grow without bound.
+        - `event` is part of the key. It wasn't before, which meant two
+          different events sharing a timestamp and price (a Sold and the
+          Listing Removed that follows it) collapsed into one row.
+
+        `source_event_id` is included as a discriminator only. It is NOT
+        unique per event — Redfin's `sourceId` is the MLS listing number, and
+        every event in a listing cycle repeats it (verified: 29,553 raw
+        payloads have a repeated id) — so uniqueness must never be keyed on it
+        alone. Its value is telling one listing *run* apart from the next.
+
+        Duplicates WITHIN a single payload are dropped too, not just against
+        what's already stored. Redfin sometimes reports the same event twice
+        in one `event_history` (verified: a "Pending" on 2014-05-15 repeated
+        in the same response). The database check below can't catch those —
+        neither copy is flushed yet when the second is examined — so without
+        an in-batch guard both get added and the flush dies on the
+        `uq_price_history_event` violation, taking the whole property with it.
+        """
+        added_any = False
+        seen_in_batch = set()
+
         for entry in entries:
-            price = entry.get("price")
             event_date = entry.get("event_date")
-            if not price or not event_date:
+            if not event_date:
                 continue
+            price = entry.get("price")
+            event = entry.get("event") or "Unknown"
+            source_event_id = entry.get("source_event_id")
+
+            # Same shape as the unique index's key.
+            batch_key = (event, event_date, price, source_event_id)
+            if batch_key in seen_in_batch:
+                continue
+            seen_in_batch.add(batch_key)
+
+            # Identity of an event, without the listing-run discriminator.
+            same_event = (
+                PriceHistory.property_id == property_id,
+                PriceHistory.source == source,
+                PriceHistory.event == event,
+                PriceHistory.event_date == event_date,
+                PriceHistory.price.is_not_distinct_from(price),
+            )
+
             result = await session.execute(
-                select(PriceHistory.id).where(
-                    PriceHistory.property_id == property_id,
-                    PriceHistory.source == source,
-                    PriceHistory.event_date == event_date,
-                    PriceHistory.price == price,
+                select(PriceHistory).where(
+                    *same_event,
+                    PriceHistory.source_event_id.is_not_distinct_from(source_event_id),
                 )
             )
             # .first() not .scalar_one_or_none(): this only needs to know
@@ -416,18 +522,61 @@ class PipelineRunner:
             # this dedup check existed (e.g. runs recorded under the old
             # 'redfinscraper' source bug) would make scalar_one_or_none()
             # raise MultipleResultsFound instead of just confirming a match.
-            if result.scalars().first():
+            existing = result.scalars().first()
+
+            if existing is None and source_event_id is not None:
+                # Fall back to a stored copy of this same event that predates
+                # `source_event_id` being captured at all. Without this, an
+                # event stored as (..., NULL) and re-scraped as (..., 'O642')
+                # is NULL-vs-value under IS NOT DISTINCT FROM, reads as a
+                # different event, and gets inserted a second time — which is
+                # exactly how a backfill doubled this table. Adopt the row and
+                # fill in the id rather than duplicating it.
+                result = await session.execute(
+                    select(PriceHistory).where(
+                        *same_event, PriceHistory.source_event_id.is_(None)
+                    )
+                )
+                existing = result.scalars().first()
+                if existing is not None:
+                    existing.source_event_id = source_event_id
+                    added_any = True
+
+            new_event_type = entry.get("event_type")
+            is_rental_event = bool(entry.get("is_rental_event"))
+
+            if existing:
+                # `event_type` and `is_rental_event` are DERIVED — the
+                # normalizer recomputes both by walking the property's whole
+                # timeline, so a later scrape that sees more history can
+                # legitimately correct an earlier verdict (a "Price Changed"
+                # with nothing before it resolves to `price_changed`, but once
+                # an earlier priced event shows up it becomes `reduced`).
+                # Skipping the row entirely, as this used to, meant that
+                # correction could never land.
+                if existing.event_type != new_event_type or existing.is_rental_event != is_rental_event:
+                    existing.event_type = new_event_type
+                    existing.is_rental_event = is_rental_event
+                    added_any = True
                 continue
+
             session.add(PriceHistory(
                 property_id=property_id,
                 source=source,
                 price=price,
-                event=entry.get("event", "listed"),
+                event=event,
+                event_type=new_event_type,
                 event_date=event_date,
+                event_source=entry.get("event_source"),
+                source_event_id=source_event_id,
+                is_rental_event=is_rental_event,
             ))
+            added_any = True
+        return added_any
 
     @staticmethod
-    async def _upsert_tax_history(session: AsyncSession, property_id, source: str, entries: list) -> None:
+    async def _upsert_tax_history(session: AsyncSession, property_id, source: str, entries: list) -> bool:
+        changed = False
         for entry in entries:
             tax_year = entry.get("tax_year")
             if not tax_year:
@@ -442,37 +591,53 @@ class PipelineRunner:
             # .first() not .scalar_one_or_none() — see the note in
             # _upsert_price_history on why scalar_one_or_none() is risky here.
             existing = result.scalars().first()
+            # `assessed_value` is only set when both components are present —
+            # see RedfinNormalizer._extract_tax_history. The components are
+            # carried through so a partial assessment stays inspectable rather
+            # than collapsing to an unexplained NULL.
+            fields = {
+                "tax_amount": entry.get("tax_amount"),
+                "land_value": entry.get("land_value"),
+                "improvement_value": entry.get("improvement_value"),
+                "assessed_value": entry.get("assessed_value"),
+            }
             if existing:
+                if any(getattr(existing, key) != value for key, value in fields.items()):
+                    changed = True
                 # A county reassessment can revise a prior year's figures, so
                 # update in place rather than skip.
-                existing.tax_amount = entry.get("tax_amount")
-                existing.assessed_value = entry.get("assessed_value")
+                for key, value in fields.items():
+                    setattr(existing, key, value)
             else:
                 session.add(TaxHistory(
                     property_id=property_id,
                     source=source,
                     tax_year=tax_year,
-                    tax_amount=entry.get("tax_amount"),
-                    assessed_value=entry.get("assessed_value"),
+                    **fields,
                 ))
+                changed = True
+        return changed
 
     # ------------------------------------------------------------------
     # 1:1 and zip-level tables: merge-or-insert on the natural key
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def _upsert_one_to_one(session: AsyncSession, model, property_id, data: Optional[dict]) -> None:
+    async def _upsert_one_to_one(session: AsyncSession, model, property_id, data: Optional[dict]) -> bool:
         if not data:
-            return
+            return False
         valid_keys = {c.name for c in model.__table__.columns} - {"property_id"}
         payload = {k: v for k, v in data.items() if k in valid_keys}
 
         existing = await session.get(model, property_id)
         if existing:
+            changed = any(getattr(existing, key) != value for key, value in payload.items())
             for key, value in payload.items():
                 setattr(existing, key, value)
+            return changed
         else:
             session.add(model(property_id=property_id, **payload))
+            return True
 
     @staticmethod
     async def _upsert_market_snapshot(session: AsyncSession, data: Optional[dict]) -> None:

@@ -4,11 +4,14 @@ CLI entry point for Aevorex scraper.
 Commands:
 - scrape --source [platform] --state [state]
 - retry --source [platform] --state [state]
+- analyze            (market-stats -> value -> score, in the only order that works)
+- market-stats / value / score   (the individual stages)
 - scheduler
 """
 
 import asyncio
 import logging
+import sys
 
 import click
 
@@ -192,6 +195,150 @@ def scheduler():
     from aevorex.scheduler.jobs import start_scheduler
 
     asyncio.run(start_scheduler())
+
+
+@cli.command("market-stats")
+def market_stats():
+    """
+    Rebuild zip/city/county/state market baselines from sold comps and live listings.
+
+    Run this before `value` and `score` — both read these baselines to express
+    a property's numbers relative to its own market rather than to a fixed
+    national threshold. Prefer `analyze`, which runs the three in order.
+    """
+    logger.info("Building market statistics...")
+    _run_stage(_build_market_stats())
+
+
+async def _build_market_stats() -> dict:
+    from aevorex.market.stats import build_market_stats
+
+    async with async_session_maker() as session:  # type: ignore
+        stats = await build_market_stats(session)
+        logger.info(
+            "Market stats: %s cells written (%s sold, %s listing)",
+            stats["cells_written"], stats["sold_cells"], stats["listing_cells"],
+        )
+        return stats
+
+
+@cli.command()
+@click.option("--all", "all_properties", is_flag=True,
+              help="Revalue every property, not just those flagged needs_analysis.")
+@click.option("--limit", type=int, default=None, help="Cap the number valued (for testing).")
+def value(all_properties: bool, limit: int):
+    """
+    Derive market value, ARV, rehab, rent and carrying costs for each property.
+
+    Reads the baselines written by `market-stats`, so run that first. Writes
+    property_valuation, which every scorer then reads. Prefer `analyze`.
+    """
+    logger.info("Starting valuation pass...")
+    _run_stage(_value_all(all_properties, limit))
+
+
+async def _value_all(all_properties: bool = False, limit: int = None) -> dict:
+    from aevorex.valuation.engine import ValuationEngine
+
+    async with async_session_maker() as session:  # type: ignore
+        stats = await ValuationEngine().run(
+            session, all_properties=all_properties, limit=limit
+        )
+        logger.info(
+            "Valuation: total=%s valued=%s no_value=%s errors=%s",
+            stats["total"], stats["valued"], stats["no_value"], stats["errors"],
+        )
+        return stats
+
+
+@cli.command()
+@click.option("--all", "all_properties", is_flag=True,
+              help="Rescore every property, not just those flagged needs_analysis.")
+def score(all_properties: bool):
+    """
+    Score every property against all 5 investment strategies, then rank them.
+
+    Requires `value` to have run first: four of the five strategies read
+    property_valuation and return NULL without it. Prefer `analyze`.
+    """
+    logger.info("Starting scoring run...")
+    _run_stage(_score_all(all_properties))
+
+
+async def _score_all(all_properties: bool = False) -> dict:
+    """Run the scoring pass within a single session/transaction-per-property."""
+    from aevorex.scoring.runner import ScoringRunner
+
+    async with async_session_maker() as session:  # type: ignore
+        stats = await ScoringRunner().run(session, all_properties=all_properties)
+        logger.info(
+            "Scoring result: total=%s scored=%s unvalued=%s errors=%s ranked=%s",
+            stats["total"], stats["scored"], stats.get("unvalued"),
+            stats["errors"], stats["ranked"],
+        )
+        return stats
+
+
+@cli.command()
+@click.option("--all", "all_properties", is_flag=True,
+              help="Reprocess every property, not just those flagged needs_analysis.")
+@click.option("--skip-market-stats", is_flag=True,
+              help="Reuse the existing baselines instead of rebuilding them.")
+def analyze(all_properties: bool, skip_market_stats: bool):
+    """
+    Run the full analysis chain: market-stats -> value -> score.
+
+    WHY THIS EXISTS
+    ---------------
+    The three stages are strictly ordered and each depends on the one before:
+    `value` reads the baselines `market-stats` writes, and four of the five
+    scorers read the `property_valuation` rows `value` writes. Running `score`
+    on freshly scraped inventory without the first two stages does not fail —
+    it produces analysis rows in which only motivated_seller is populated and
+    every other strategy carries a "couldn't score" rationale. That is exactly
+    what happened to the first Palm Coast run: 416 properties scraped, 416
+    analysis rows written, 0 valuations behind them.
+
+    The ordering is also load-bearing for the `needs_analysis` flag. Both
+    `value` and `score` select on it and `score` clears it, so scoring first
+    leaves the valuation stage with nothing to do and no way to notice. Here
+    the flag is read by valuation and only then consumed by scoring.
+    """
+    logger.info("Starting full analysis chain...")
+    _run_stage(_analyze_all(all_properties, skip_market_stats))
+
+
+async def _analyze_all(all_properties: bool = False,
+                       skip_market_stats: bool = False) -> dict:
+    """The chain itself. Aborts on the first stage that raises."""
+    results: dict = {}
+    if skip_market_stats:
+        logger.info("Skipping market-stats rebuild (--skip-market-stats).")
+    else:
+        logger.info("Stage 1/3: market baselines")
+        results["market_stats"] = await _build_market_stats()
+
+    logger.info("Stage 2/3: valuation")
+    results["valuation"] = await _value_all(all_properties=all_properties)
+
+    logger.info("Stage 3/3: scoring")
+    results["scoring"] = await _score_all(all_properties=all_properties)
+    return results
+
+
+def _run_stage(coro) -> None:
+    """
+    Drive one async stage, and exit non-zero if it fails.
+
+    The stages used to swallow their own exceptions and log them, which meant
+    a chained run would carry on past a broken stage and a CI or cron caller
+    would see success. A failed stage must stop the chain.
+    """
+    try:
+        asyncio.run(coro)
+    except Exception as e:
+        logger.error("Stage failed: %s", e, exc_info=True)
+        sys.exit(1)
 
 
 @cli.command()

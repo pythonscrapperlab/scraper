@@ -56,6 +56,8 @@ class RealtorNormalizer(BaseNormalizer):
                 "property_type": platform_dict.get("property_type"),
                 "listing_status": platform_dict.get("listing_status"),
                 "days_on_market": platform_dict.get("days_on_market"),
+                "days_on_market_mls": platform_dict.get("days_on_market_mls"),
+                "has_open": platform_dict.get("has_open"),
                 "listing_url": platform_dict.get("listing_url"),
                 "description": platform_dict.get("description"),
                 "latitude": platform_dict.get("latitude"),

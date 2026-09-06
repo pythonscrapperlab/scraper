@@ -46,6 +46,15 @@ class ScraperJobs:
             )
             logger.info(f"Registered Realtor scraper job (every {settings.scheduler_realtor_interval_hours}h)")
 
+        if settings.scoring_enabled:
+            self.scheduler.add_job(
+                self._run_analysis,
+                "interval",
+                hours=settings.scheduler_scoring_interval_hours,
+                id="property_scoring",
+            )
+            logger.info(f"Registered analysis job (every {settings.scheduler_scoring_interval_hours}h)")
+
     async def _scrape_zillow(self):
         """Zillow scraper job."""
         logger.info("Running Zillow scraper job...")
@@ -78,6 +87,25 @@ class ScraperJobs:
                 await _scrape_single("realtor", state)
             except Exception as e:
                 logger.error(f"Error scraping Realtor for {state}: {e}")
+
+    async def _run_analysis(self):
+        """
+        Analysis job — rebuilds market baselines, values, then scores.
+
+        This used to call scoring alone, which was wrong for any newly
+        scraped market: four of the five scorers read `property_valuation`,
+        so scoring without a preceding valuation pass writes analysis rows
+        where only motivated_seller is populated. The scrape job and this job
+        are the only things running on a live box, so if the chain is not
+        here it is nowhere.
+        """
+        logger.info("Running analysis job (market-stats -> value -> score)...")
+        from main import _analyze_all
+
+        try:
+            await _analyze_all()
+        except Exception as e:
+            logger.error(f"Error running analysis job: {e}", exc_info=True)
 
     def start(self):
         """Start scheduler."""

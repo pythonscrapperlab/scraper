@@ -68,3 +68,5 @@ node_modules/
 package-lock.json
 
 */venv
+# Local DB backups (large binary dumps)
+backups/

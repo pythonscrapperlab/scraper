@@ -43,11 +43,11 @@ class RedfinScraper(BaseScraper):
             if self.proxy_manager.user and self.proxy_manager.password:
                 self.proxy_manager.enabled = True
 
-        self.base_filters = "/filter/sort=lo-days,property-type=house+condo+townhouse+multifamily,max-year-built=2024,max-days-on-market=2mo,include=forsale+mlsfsbo+fsbo,exclude-short-sale,exclude-age-restricted,exclude-land-lease/page-[PAGE]"
+        self.base_filters = "/filter/sort=lo-days,min-price=50k,property-type=house+condo+townhouse+multifamily,max-days-on-market=4mo,include=forsale+mlsfsbo+fsbo,exclude-age-restricted,exclude-land-lease/page-[PAGE]"
 
     def _new_client(self) -> HttpClient:
         """Create an HttpClient bound to webshare's rotating gateway (or no proxy)."""
-        proxy = self.proxy_manager.get_rotating_proxy_url_dataimpulse()
+        proxy = self.proxy_manager.get_rotating_proxy_url()
         if proxy:
             return HttpClient(proxy=proxy)
         return HttpClient()
@@ -88,12 +88,19 @@ class RedfinScraper(BaseScraper):
         """Fetch and parse a single results page using a shared client."""
         page_url = f"{url}{self.base_filters}".replace("[PAGE]", str(page))
         self.logger.info(f"Fetching Redfin Property Listing page {page} ...")
-        try:
-            res = await client.get_text(page_url)
-            return self._parse_homecards(res)  # type: ignore
-        except Exception as e:
-            self.logger.warning(f"Failed to fetch page {page} for {url}: {e}")
-            return []
+        # Try fetching page for 3 times
+        for i in range(3):
+            try:
+                res = await client.get_text(page_url)
+                return self._parse_homecards(res)  # type: ignore
+            except Exception as e:
+                self.logger.warning(f"Attempt {i+1}: Failed to fetch page {page} for {url}: {e}")
+                await asyncio.sleep(2)  # Wait before retrying
+                
+            client = self._new_client()
+        
+        self.logger.error(f"Failed to fetch page {page} for {url} after 3 attempts.")
+        return []
 
     async def get_property_urls(self, url: str) -> List[str]:
         """
@@ -121,10 +128,12 @@ class RedfinScraper(BaseScraper):
                 total_pages = math.ceil(total_properties / 40)
             except Exception:
                 total_pages = 1
+            # total_pages = 2
+            print(f"Found {total_properties} properties across {total_pages} pages for {url}")
             
-            if total_pages >30:
-                self.logger.warning(f"Redfin search {url} has {total_pages} pages, which exceeds the limit of 20. Only fetching the first 20 pages.")
-                total_pages = 30
+            # if total_pages >20:
+            #     self.logger.warning(f"Redfin search {url} has {total_pages} pages, which exceeds the limit of 20. Only fetching the first 20 pages.")
+            #     total_pages = 20
             
             if total_pages < 2:
                 return property_urls
@@ -189,17 +198,20 @@ class RedfinScraper(BaseScraper):
             'upgrade-insecure-requests': '1',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
         }
-        client = self._new_client()
-        try:
-            # Property page — return HTML
-            self.logger.info(f"Fetching Redfin property page: {url}")
-            response = await client.get_text(url, headers=headers)
-            return response # type: ignore
-        except Exception as e:
-            print(f"Error fetching {url}: {e}")
-            return None
-        finally:
-            await client.close()
+        # Try fetching page for 3 times
+        for i in range(3):
+            client = self._new_client()
+            try:
+                # Property page — return HTML
+                self.logger.info(f"Fetching Redfin property page: {url}")
+                response = await client.get_text(url, headers=headers)
+                return response # type: ignore
+            except Exception as e:
+                self.logger.warning(f"Attempt {i+1}: Failed to fetch {url}: {e}")
+                await asyncio.sleep(2)  # Wait before retrying
+        self.logger.error(f"Failed to fetch {url} after 3 attempts.")
+        await client.close()
+        return None
 
     async def parse(self, raw: str) -> Optional[Dict[str, Any]]:
         """
@@ -295,6 +307,18 @@ class RedfinScraper(BaseScraper):
         
         return property_data
     
+    @staticmethod
+    def primary_category(place: dict) -> dict:
+        """Pick one representative category from a POI's category list."""
+        cats = place.get("categories") or []
+        if not cats:
+            return {"label": None, "group": None}
+        # categoryPriority 1 marks Redfin's own primary tag (e.g. Publix ->
+        # "Grocery Store / Supermarket"). Most places have all-zero priority,
+        # so fall back to the broadest level, which is the groupable one.
+        best = min(cats, key=lambda c: (-c.get("categoryPriority", 0), c.get("level", 99)))
+        return {"label": best.get("label"), "group": best.get("redfinCategory")}
+    
     async def extract_redfin_data(self, html: str) -> dict:
         """
         Extract all property data from Redfin's __reactServerState.InitialContext.
@@ -350,7 +374,7 @@ class RedfinScraper(BaseScraper):
         amenities     = history.get("amenitiesInfo", {})
         pub_history           = history.get("publicRecordsInfo", {})
         prop_history  = history.get("propertyHistoryInfo", {})
-        
+        tor = addr.get("timeOnRedfin")
         # --- Property core ---
         result = {
             "address":          addr.get("assembledAddress") or main.get("streetAddress"),
@@ -377,7 +401,9 @@ class RedfinScraper(BaseScraper):
             "property_type":    addr.get("propertyType"),
             "status":           addr.get("status", {}).get("displayValue"),
             "mls_id":           main.get("mlsId"),
-            "days_on_market":   addr.get("cumulativeDaysOnMarket"),
+            "days_on_market":   round(tor / 86_400_000) if tor else None,
+            "days_on_market_mls":addr.get("cumulativeDaysOnMarket"),
+            "has_open":          addr.get("hasOpen"),
             "listing_agent":    main.get("listingAgents", [{}])[0].get("agentInfo", {}).get("agentName"),
 
             # HOA / Fees
@@ -452,6 +478,7 @@ class RedfinScraper(BaseScraper):
                     "baths":   c.get("baths"),
                     "sqft":    c.get("sqFt", {}).get("value"),
                     "sold_date": c.get("soldDate"),
+                    "url":     f"https://www.redfin.com{c.get('url')}" if c.get("url") else None,
                 }
                 for c in avm.get("comparables", [])
             ],
@@ -484,11 +511,37 @@ class RedfinScraper(BaseScraper):
             
             "county": pub.get("countyName", ""),
             "mls": amenities.get("mlsDisclaimerInfo"),
-            "amenities": {entity.get("amenityName") or entity.get("referenceName"):", ".join(entity.get("amenityValues", [])) for am in amenities.get("superGroups") for group in am.get("amenityGroups") for entity in group.get("amenityEntries")},
-            
+            "amenities": {
+                entity.get("amenityName") or entity.get("referenceName"):
+                    ", ".join(entity.get("amenityValues", []))
+                for am in (amenities.get("superGroups") or [])
+                for group in (am.get("amenityGroups") or [])
+                for entity in (group.get("amenityEntries") or [])
+            },
             # Around the home place
-            "places": [{"name":place.get("name"), "popularity": place.get("popularity"), "distance": place.get("distance")} for place in around_home.get("pointOfInterestList", [])],
-            "Transport": {trans.get("stopName") for trans in around_home.get("transitData", {}).get("stops", [])},
+            "places": [
+                {
+                    "name":       place.get("name"),
+                    "popularity": place.get("popularity"),
+                    "distance":   place.get("distance"),
+                    "category":   self.primary_category(place)["label"],
+                }
+                for place in (around_home.get("pointOfInterestList") or [])
+            ],
+            # A sorted list, not a set. This was a set comprehension, and a set
+            # isn't JSON-serializable, so it reached raw_scrapes.raw_json as
+            # str(set) — "{'PGA BLVD at TOYS R US', 'Gardens Mall'}" — on all
+            # 10,935 existing scrapes. That's lossy (any stop name containing an
+            # apostrophe breaks the round-trip back out) and non-deterministic
+            # (set iteration order varies per process, so every rescrape looked
+            # like the stop list had changed). Sorting also makes the field
+            # diffable across scrapes. Deduped, since a stop can be listed once
+            # per route.
+            "Transport": sorted({
+                stop.get("stopName")
+                for stop in around_home.get("transitData", {}).get("stops", [])
+                if stop.get("stopName")
+            }),
             
             "location_score": location
         }

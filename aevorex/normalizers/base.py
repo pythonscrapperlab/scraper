@@ -2,7 +2,10 @@
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
+import logging
 import re
+
+logger = logging.getLogger("aevorex.normalizers.base")
 
 
 class BaseNormalizer(ABC):
@@ -38,6 +41,61 @@ class BaseNormalizer(ABC):
             return ""
         digits = re.sub(r'\D', '', zip_code)
         return digits[:5]
+
+    @staticmethod
+    def normalize_state(state: Optional[str]) -> Optional[str]:
+        """
+        Uppercase 2-letter state code.
+
+        Sources are inconsistent about casing ("FL" / "Fl" / "fl" all appear
+        in production data from the same scraper), and every state-scoped
+        query and the APN dedup lookup are plain equality matches, so a
+        single lowercased row silently falls out of all of them.
+        """
+        if not state:
+            return None
+        cleaned = re.sub(r'[^A-Za-z]', '', str(state)).upper()
+        if len(cleaned) > 2:
+            # Sources send the 2-letter code; a full state name would be
+            # truncated to something wrong ("GEORGIA" -> "GE") rather than
+            # translated, so make the guess visible instead of silent.
+            logger.warning("Unexpected state value %r; storing %r.", state, cleaned[:2])
+        return cleaned[:2] or None
+
+    # Canonical listing-status slugs. The raw source string is always kept
+    # alongside these (Property.listing_status) — this is the queryable form,
+    # not a replacement for the source's own wording.
+    LISTING_STATUS_RULES = (
+        ("coming soon", "coming_soon"),
+        ("contingent", "contingent"),
+        ("backup", "contingent"),
+        ("pending", "pending"),
+        ("sold", "sold"),
+        ("closed", "sold"),
+        ("active", "active"),
+        ("for sale", "active"),
+        ("new", "new"),
+    )
+
+    @classmethod
+    def normalize_listing_status(cls, status: Optional[str]) -> Optional[str]:
+        """
+        Map a source's MLS status to a canonical slug, or None.
+
+        Handles the source's own formatting damage without editing it away:
+        Redfin ships "Contingent- Accepting Backups" (note the missing space),
+        which normalizes to "contingent" here while the malformed original
+        stays in Property.listing_status.
+        """
+        if not status or not isinstance(status, str):
+            return None
+        normalized = " ".join(status.strip().lower().split())
+        if not normalized:
+            return None
+        for needle, slug in cls.LISTING_STATUS_RULES:
+            if needle in normalized:
+                return slug
+        return None
 
     @abstractmethod
     async def normalize(self, platform_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:

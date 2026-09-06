@@ -46,9 +46,9 @@ class Settings(BaseSettings):
 
     # === Transport: Proxies ===
     proxy_enabled: bool = True  # Disabled by default
-    proxy_provider: str = "dataimpulse"  # brightdata | oxylabs | smartproxy | webshare
-    proxy_user: Optional[str] = "65d7bcf395b433695f25__cr.us"
-    proxy_password: Optional[str] = "f4bd3ade927be378"
+    proxy_provider: str = "webshare"  # brightdata | oxylabs | smartproxy | webshare | dataimpulse
+    proxy_user: Optional[str] = "zoroupwork-US-rotate"
+    proxy_password: Optional[str] = "burhanburhan"
     proxy_zone: Optional[str] = "US"
 
     # === Scraping: Zillow ===
@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     scheduler_zillow_interval_hours: int = 6
     scheduler_redfin_interval_hours: int = 6
     scheduler_realtor_interval_hours: int = 6
+    scheduler_scoring_interval_hours: int = 6
+
+    # === Scoring ===
+    scoring_enabled: bool = True
 
     # === Logging ===
     log_level: str = "INFO"

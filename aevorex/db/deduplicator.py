@@ -1,12 +1,30 @@
 """Deduplication logic for matching and merging properties across sources."""
 
 import re
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aevorex.db.models import Property
+from aevorex.db.models import Property, utc_now
+
+# Which platform a `primary_source` value refers to, highest priority first.
+# Realtor's data is the most complete of the three, Zillow's the least, so a
+# property confirmed by several platforms should present Realtor's view.
+SOURCE_PRIORITY = {"realtor": 3, "redfin": 2, "zillow": 1}
+
+# The three per-platform ID columns on Property, in the same priority order.
+# `source_count` is derived from how many of these are populated — never
+# incremented — see the note in upsert().
+PLATFORM_ID_COLUMNS = {
+    "realtor": "realtor_id",
+    "redfin": "redfin_id",
+    "zillow": "zillow_id",
+}
+
+# Where the last price each platform reported is kept, inside Property.meta.
+# There is no per-source price column on Property (only the single winning
+# `price`), so cross-source disagreement has nowhere else to live.
+SOURCE_PRICES_META_KEY = "source_prices"
 
 # Fields on the normalized-data dict that live in satellite tables, not as
 # plain columns on Property. Never setattr these directly onto a Property
@@ -181,15 +199,24 @@ class Deduplicator:
         if not address or not zip_code:
             return None
 
-        from sqlalchemy import select, func
+        from sqlalchemy import select
 
         norm_addr = Deduplicator.normalize_address(address)
         norm_zip = Deduplicator.normalize_zip(zip_code)
+        if not norm_addr or not norm_zip:
+            return None
 
-        # Query: Find matching properties by comparing normalized values
-        # Fetch all properties with matching zip, then normalize in Python
+        # Match on the NORMALIZED zip, not the raw one. Stored zips are always
+        # the 5-digit form, so a scrape arriving as "33401-1234" would compare
+        # against nothing and silently insert a duplicate property.
+        #
+        # Still a Python-side scan of one zip's properties, because the stored
+        # address isn't normalized in the column. That's bounded (a few hundred
+        # rows per zip today) but it is the slow path in dedup — worth a
+        # generated/normalized address column if this table grows an order of
+        # magnitude.
         query = select(Property).where(
-            Property.zip_code == zip_code
+            Property.zip_code == norm_zip
         )
 
         result = await session.execute(query)
@@ -252,23 +279,74 @@ class Deduplicator:
         return None
 
     @staticmethod
-    def calculate_price_variance(prices: list) -> float:
+    def calculate_price_variance(prices: list) -> Optional[float]:
         """
-        Calculate price variance percentage.
+        Spread between the highest and lowest price, as a percentage of the
+        lowest — i.e. how much the sources disagree about what this property
+        is listed at.
 
-        Returns: max(prices) / min(prices) * 100 - 100 (percent difference)
+        Returns None, not 0.0, when there aren't two prices to compare.
+        0.0 means "every source reports the same number", which is a real and
+        useful statement; returning it for a single-source property asserts a
+        cross-source agreement that was never observed. This previously
+        returned 0.0 in both cases, so the column read as "all sources agree"
+        across a database that only ever had one source.
         """
-        if len(prices) < 2:
-            return 0.0
+        usable = [p for p in prices if p and p > 0]
+        if len(usable) < 2:
+            return None
 
-        prices = [p for p in prices if p and p > 0]
-        if len(prices) < 2:
-            return 0.0
+        min_price = min(usable)
+        max_price = max(usable)
+        return round(((max_price - min_price) / min_price) * 100, 2)
 
-        min_price = min(prices)
-        max_price = max(prices)
-        variance = ((max_price - min_price) / min_price) * 100
-        return round(variance, 2)
+    @staticmethod
+    def _source_prices(meta: Optional[dict]) -> Dict[str, int]:
+        """Read the per-platform price map out of Property.meta, defensively."""
+        raw = (meta or {}).get(SOURCE_PRICES_META_KEY)
+        if not isinstance(raw, dict):
+            return {}
+        prices: Dict[str, int] = {}
+        for platform, value in raw.items():
+            if platform not in SOURCE_PRIORITY:
+                continue
+            try:
+                price = int(value)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                prices[platform] = price
+        return prices
+
+    @staticmethod
+    def _count_sources(property_obj: Property) -> int:
+        """
+        How many platforms have actually contributed to this row.
+
+        Derived from the populated platform-ID columns rather than counted up
+        over time. The previous implementation did `source_count + 1` on every
+        upsert, which counted *rescrapes* — a single-source database ended up
+        with a third of its rows claiming three-source confirmation, and any
+        confidence weighting built on the column inherited that.
+        """
+        return sum(
+            1 for column in PLATFORM_ID_COLUMNS.values() if getattr(property_obj, column, None)
+        ) or 1
+
+    @staticmethod
+    def _pick_primary_source(current: Optional[str], incoming: str) -> str:
+        """
+        Keep whichever of the two platforms ranks highest: Realtor > Redfin > Zillow.
+
+        Without this, `primary_source` was simply whichever platform scraped
+        most recently, so a Zillow rescrape would silently demote a property
+        that Realtor had already provided better data for.
+        """
+        if not current:
+            return incoming
+        if SOURCE_PRIORITY.get(incoming, 0) > SOURCE_PRIORITY.get(current, 0):
+            return incoming
+        return current
 
     @staticmethod
     async def upsert(
@@ -307,6 +385,12 @@ class Deduplicator:
             # Update existing property
             is_new = False
 
+            # Read the prior per-source price map before the update loop below
+            # overwrites `meta` wholesale with this scrape's freshly built one.
+            # Losing it here is what would make cross-source variance
+            # uncomputable on the very next scrape.
+            source_prices = Deduplicator._source_prices(existing.meta)
+
             # Set platform-specific ID
             if source == "zillow":
                 existing.zillow_id = external_id or existing.zillow_id
@@ -315,23 +399,55 @@ class Deduplicator:
             elif source == "realtor":
                 existing.realtor_id = external_id or existing.realtor_id
 
-            # Update fields (prefer non-None new values)
+            # Update fields (prefer non-None new values).
+            # `primary_source` is deliberately excluded — it's resolved by
+            # source priority below, not by whichever platform scraped last.
             for key, value in normalized_data.items():
-                if value is not None and key not in ("zillow_id", "redfin_id", "realtor_id"):
-                    if key not in SATELLITE_KEYS:
-                        setattr(existing, key, value)
+                if value is None:
+                    continue
+                if key in ("zillow_id", "redfin_id", "realtor_id", "primary_source"):
+                    continue
+                if key in SATELLITE_KEYS:
+                    continue
+                setattr(existing, key, value)
 
-            # Recalculate price variance
-            prices = [
-                existing.price,
-                normalized_data.get("price"),
-            ]
-            prices = [p for p in prices if p]
-            if prices:
-                existing.price_variance = Deduplicator.calculate_price_variance(prices) # type: ignore
+            existing.primary_source = Deduplicator._pick_primary_source( # type: ignore
+                existing.primary_source, source
+            )
 
-            # Increment source count
-            existing.source_count = min(existing.source_count + 1, 3) # type: ignore
+            # Record what THIS platform says the price is, then measure the
+            # spread across platforms. Comparing `existing.price` against the
+            # incoming price (as this used to) compares the property against
+            # itself: the update loop above has already assigned the new price,
+            # so both sides of the comparison were identical and the column was
+            # 0.0 on every row. It also wouldn't have been cross-source
+            # variance even when it worked — that's price movement over time,
+            # which belongs in price_history.
+            incoming_price = normalized_data.get("price")
+            if incoming_price:
+                source_prices[source] = int(incoming_price)
+            if source_prices:
+                new_meta = dict(existing.meta or {})
+                new_meta[SOURCE_PRICES_META_KEY] = source_prices
+                existing.meta = new_meta # type: ignore
+
+            existing.price_variance = Deduplicator.calculate_price_variance( # type: ignore
+                list(source_prices.values())
+            )
+            existing.source_count = Deduplicator._count_sources(existing) # type: ignore
+            existing.last_seen_at = utc_now() # type: ignore
+
+            # Flag for rescoring only if a scalar column genuinely changed
+            # value — session.is_modified() does a real equality comparison
+            # against the persisted baseline `existing` was loaded with
+            # (via find_existing() above), not just "was setattr called," so
+            # a no-op rescrape (identical data) correctly leaves the flag
+            # alone. Satellite-table changes (price_history, tax_history,
+            # comps, location_score, features) are handled separately in
+            # PipelineRunner._upsert_satellites, since those are independent
+            # rows, not attributes on this Property instance.
+            if session.is_modified(existing, include_collections=False):
+                existing.needs_analysis = True # type: ignore
 
             property_obj = existing
 
@@ -345,9 +461,20 @@ class Deduplicator:
                 if k not in SATELLITE_KEYS and k != "primary_source"
             }
 
+            # Seed the per-source price map from the very first scrape, so the
+            # second platform to arrive has something to disagree with.
+            # price_variance itself stays NULL until there are two sources —
+            # a single source can't disagree with anything.
+            incoming_price = normalized_data.get("price")
+            if incoming_price:
+                meta = dict(data_for_property.get("meta") or {})
+                meta[SOURCE_PRICES_META_KEY] = {source: int(incoming_price)}
+                data_for_property["meta"] = meta
+
             property_obj = Property(
                 primary_source=normalized_data.get("primary_source") or source,
                 source_count=1,
+                needs_analysis=True,
                 **data_for_property
             )
 
@@ -362,13 +489,3 @@ class Deduplicator:
         session.add(property_obj)
         await session.flush()  # Ensure ID is generated
         return property_obj, is_new
-
-    @staticmethod
-    def _pick_primary_source(source: str) -> str:
-        """
-        Pick primary source based on priority.
-
-        Priority: Realtor > Redfin > Zillow
-        """
-        priority = {"realtor": 3, "redfin": 2, "zillow": 1}
-        return source  # For now, use the current source (can enhance later to compare all)
