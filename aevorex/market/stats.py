@@ -36,7 +36,7 @@ against nothing, and the score carries the fact that it had to.
 
 import logging
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession

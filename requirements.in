@@ -1,0 +1,35 @@
+# Runtime
+alembic
+apscheduler
+asyncpg
+beautifulsoup4
+celery
+click
+fastapi
+httpx
+lxml
+playwright
+pydantic
+pydantic-settings
+python-dateutil
+python-dotenv
+python-json-logger
+python-multipart
+PyYAML
+redis
+requests
+selenium
+sqlalchemy[asyncio]
+tenacity
+uvicorn[standard]
+
+# Development and verification
+mypy
+pip-tools
+pytest
+pytest-asyncio
+pytest-cov
+ruff
+types-python-dateutil
+types-PyYAML
+types-requests

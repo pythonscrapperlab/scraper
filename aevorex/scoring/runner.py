@@ -95,10 +95,10 @@ class ScoringRunner:
                 if not await self._score_one(session, prop):
                     stats["unvalued"] += 1
                 stats["scored"] += 1
-            except Exception:
+            except Exception as exc:
                 await session.rollback()
                 stats["errors"] += 1
-                logger.error("Failed to score property %s", prop.id, exc_info=True)
+                logger.error("Scoring failed: error_class=%s", type(exc).__name__)
             if index % 500 == 0:
                 logger.info("  ... %d/%d", index, len(properties))
 

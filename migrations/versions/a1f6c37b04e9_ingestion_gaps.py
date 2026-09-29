@@ -14,9 +14,8 @@ separate exercise.
 """
 import logging
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = 'a1f6c37b04e9'

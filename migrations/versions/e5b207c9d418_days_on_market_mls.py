@@ -17,9 +17,8 @@ Coverage is currently thin (~2.7% of properties, 83% of the newest payloads)
 because the scraper only recently began capturing it, so scoring treats it as
 a preferred-but-optional input and falls back to `days_on_market`.
 """
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = 'e5b207c9d418'

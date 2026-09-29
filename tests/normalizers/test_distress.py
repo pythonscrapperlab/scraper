@@ -11,7 +11,6 @@ from datetime import datetime
 
 from aevorex.normalizers.distress import extract_distress
 
-
 # ---------------------------------------------------------------- positives
 
 

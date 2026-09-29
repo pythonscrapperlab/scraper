@@ -28,8 +28,8 @@ class ProxyManager:
         """Initialize proxy manager."""
         self.enabled = settings.proxy_enabled
         self.provider = settings.proxy_provider
-        self.user = settings.proxy_user
-        self.password = settings.proxy_password
+        self.user = settings.proxy_user.get_secret_value()
+        self.password = settings.proxy_password.get_secret_value()
         self.zone = settings.proxy_zone
         self.proxy_list = []
         self.current_index = 0

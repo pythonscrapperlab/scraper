@@ -52,15 +52,15 @@ import asyncio
 import json
 import logging
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aevorex.db.deduplicator import (
+    SATELLITE_KEYS,
     SOURCE_PRICES_META_KEY,
     Deduplicator,
-    SATELLITE_KEYS,
 )
 from aevorex.db.models import Property, RawScrape, utc_now
 from aevorex.db.session import async_session_maker, close_engine
@@ -306,10 +306,10 @@ async def run(apply: bool, limit: Optional[int]) -> BackfillStats:
 
             try:
                 outcome = await backfill_one(session, prop, payload, normalizer)
-            except Exception:
+            except Exception as exc:
                 await session.rollback()
                 stats["errors"] += 1
-                logger.error("Failed backfilling property %s", property_id, exc_info=True)
+                logger.error("Backfill failed: error_class=%s", type(exc).__name__)
                 continue
 
             if outcome is None:

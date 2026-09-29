@@ -8,7 +8,6 @@ not conservative — it is wrong, and it made a condo with a $700/month HOA look
 almost identical to a house without one.
 """
 
-import pytest
 
 from aevorex.scoring.buy_hold import BuyAndHoldScorer
 from tests.scoring.conftest import (

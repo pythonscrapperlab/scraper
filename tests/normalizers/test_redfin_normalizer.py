@@ -20,7 +20,6 @@ from aevorex.db.event_types import (
     CONTINGENT,
     DELISTED,
     INCREASED,
-    LISTED,
     PENDING,
     PRICE_CHANGED,
     REDUCED,

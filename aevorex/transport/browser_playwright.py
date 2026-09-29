@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, Optional
 
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from aevorex.config import settings
 

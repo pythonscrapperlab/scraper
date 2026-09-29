@@ -6,15 +6,22 @@ Uses asyncpg driver for PostgreSQL with connection pooling.
 
 from typing import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import URL
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from aevorex.config import settings
 
 
-def get_database_url() -> str:
+def get_database_url() -> URL:
     """Construct PostgreSQL async connection string."""
-    return f"postgresql+asyncpg://{settings.db_user}:{settings.db_password}@{settings.db_host}:{settings.db_port}/{settings.db_name}"
+    return URL.create(
+        "postgresql+asyncpg",
+        username=settings.db_user,
+        password=settings.db_password.get_secret_value(),
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+    )
 
 
 # Create async engine with connection pooling
@@ -32,9 +39,8 @@ engine = create_async_engine(
 )
 
 # Session factory for async context manager usage
-async_session_maker = sessionmaker(
+async_session_maker = async_sessionmaker(
     engine,
-    class_=AsyncSession,
     expire_on_commit=False,  # Keep loaded objects in memory after commit
     autoflush=False,  # Manual flush control
     autocommit=False,

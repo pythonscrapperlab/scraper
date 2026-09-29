@@ -1,9 +1,9 @@
 """Base normalizer class for mapping platform-specific data to unified schema."""
 
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
 import logging
 import re
+from abc import ABC, abstractmethod
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("aevorex.normalizers.base")
 

@@ -18,7 +18,6 @@ it finishes.
 import asyncio
 import json
 import logging
-import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -165,12 +164,8 @@ class PipelineRunner:
 
         except Exception as e:
             result["stats"]["errors"] += 1
-            result["errors"].append({
-                "error_type": "batch_error",
-                "error_message": str(e),
-                "traceback": traceback.format_exc(),
-            })
-            self.logger.error(f"Batch-level failure: {e}", exc_info=True)
+            result["errors"].append({"error_type": "batch_error"})
+            self.logger.error("Batch-level failure: error_class=%s", type(e).__name__)
 
         return result
 
@@ -287,14 +282,9 @@ class PipelineRunner:
         """Bump stats, log immediately (don't just bury this in the result dict), and stash for the summary."""
         result["stats"]["failed"] += 1
         result["stats"]["errors"] += 1
-        error_record = {
-            "url": url,
-            "error_type": type(e).__name__,
-            "error_message": str(e),
-            "traceback": traceback.format_exc(),
-        }
+        error_record = {"error_type": type(e).__name__}
         result["errors"].append(error_record)
-        self.logger.error(f"Failed processing {url}: {e}", exc_info=True)
+        self.logger.error("Failed processing listing: error_class=%s", type(e).__name__)
 
     async def _record_error(self, session: AsyncSession, url: str, e: Exception) -> None:
         """
@@ -309,17 +299,18 @@ class PipelineRunner:
                 url=url,
                 source=self.source,
                 error_type=type(e).__name__,
-                # SQLAlchemy/asyncpg exceptions embed the full SQL + params in str(e),
+                # Messages and tracebacks may contain listing/contact data.
                 # easily over the column's 1000-char cap — the full detail is still in
-                # `traceback` (Text, unbounded), so truncate just this field.
-                error_message=str(e)[:990],
-                traceback=traceback.format_exc(),
+                error_message=type(e).__name__,
+                traceback=None,
                 attempted_at=datetime.now(timezone.utc).replace(tzinfo=None),
             ))
             await session.commit()
-        except Exception:
+        except Exception as exc:
             await session.rollback()
-            self.logger.error(f"Failed to record scrape error for {url}", exc_info=True)
+            self.logger.error(
+                "Failed to persist scrape error: error_class=%s", type(exc).__name__
+            )
 
     async def _upsert_satellites(
         self, session: AsyncSession, property_obj: Property, normalized: dict

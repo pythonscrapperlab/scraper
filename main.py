@@ -11,13 +11,17 @@ Commands:
 
 import asyncio
 import logging
-import sys
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypeVar
 
 import click
 
 from aevorex.config import settings
 from aevorex.db import async_session_maker, close_engine
 from aevorex.logging import setup_logging
+from aevorex.run_tracking import JsonValue, tracked
+
+T = TypeVar("T")
 
 # Configure logging
 setup_logging()
@@ -53,63 +57,70 @@ def scrape(source: str, state: tuple):
     states = list(state) if state else settings.target_states
     sources = ["zillow", "redfin", "realtor"] if source == "all" else [source]
 
-    logger.info(f"Starting scrape: sources={sources}, states={states}")
+    logger.info("Starting scrape for %s source(s) and %s state(s)", len(sources), len(states))
+    _run_command(
+        "scrape",
+        {"sources": sources, "states": states},
+        lambda: _scrape_many(sources, states),
+    )
 
-    asyncio.run(_scrape_many(sources, states))
 
-
-async def _scrape_many(sources: list[str], states: list[str]) -> None:
+async def _scrape_many(sources: list[str], states: list[str]) -> dict[str, int]:
     """Run all requested scrapes within a single event loop."""
+    counts = {"total_urls": 0, "success": 0, "failed": 0, "inserted": 0, "updated": 0}
     for source in sources:
         for state in states:
-            await _scrape_single(source, state)
+            result = await _scrape_single(source, state)
+            stats = result.get("stats", {})
+            counts["total_urls"] += int(stats.get("total_urls", 0))
+            counts["success"] += int(stats.get("success", 0))
+            counts["failed"] += int(stats.get("failed", 0))
+            counts["inserted"] += int(result.get("inserted", 0))
+            counts["updated"] += int(result.get("updated", 0))
+    return counts
 
 
-async def _scrape_single(source: str, state: str) -> None:
+async def _scrape_single(source: str, state: str) -> dict[str, Any]:
     """Scrape a single source/state combination."""
     logger.info(f"Scraping {source} for {state}")
 
     # Import scraper and normalizer dynamically
     if source == "zillow":
-        from aevorex.scrapers.zillow import ZillowScraper
         from aevorex.normalizers.zillow import ZillowNormalizer
+        from aevorex.scrapers.zillow import ZillowScraper
         scraper = ZillowScraper()
         normalizer = ZillowNormalizer()
     elif source == "redfin":
-        from aevorex.scrapers.redfin import RedfinScraper
         from aevorex.normalizers.redfin import RedfinNormalizer
+        from aevorex.scrapers.redfin import RedfinScraper
         scraper = RedfinScraper()
         normalizer = RedfinNormalizer()
     elif source == "realtor":
-        from aevorex.scrapers.realtor import RealtorScraper
         from aevorex.normalizers.realtor import RealtorNormalizer
+        from aevorex.scrapers.realtor import RealtorScraper
         scraper = RealtorScraper()
         normalizer = RealtorNormalizer()
     else:
-        logger.error(f"Unknown source: {source}")
-        return
+        raise ValueError(f"Unsupported source identifier: {source}")
 
     from aevorex.pipeline.runner import PipelineRunner
 
     runner = PipelineRunner(scraper, normalizer)
 
-    async with async_session_maker() as session: # type: ignore
-        try:
-            result = await runner.run_scrape(session, state)
-            logger.info(f"Scrape result for {source}/{state}:")
-            logger.info(f"  Total: {result['stats']['total_urls']}")
-            logger.info(f"  Success: {result['stats']['success']}")
-            logger.info(f"  Failed: {result['stats']['failed']}")
-            logger.info(f"  Errors: {result['stats']['errors']}")
-            logger.info(f"  Inserted: {result['inserted']}")
-            logger.info(f"  Updated: {result['updated']}")
-
-            if result["errors"]:
-                print(result["errors"])
-                logger.warning(f"  {len(result['errors'])} errors encountered")
-
-        except Exception as e:
-            logger.error(f"Error scraping {source}/{state}: {e}", exc_info=True)
+    async with async_session_maker() as session:
+        result = await runner.run_scrape(session, state)
+        logger.info(
+            "Scrape completed: source=%s state=%s total=%s success=%s failed=%s "
+            "inserted=%s updated=%s",
+            source,
+            state,
+            result["stats"]["total_urls"],
+            result["stats"]["success"],
+            result["stats"]["failed"],
+            result["inserted"],
+            result["updated"],
+        )
+        return result
 
 
 @cli.command()
@@ -128,73 +139,75 @@ async def _scrape_single(source: str, state: str) -> None:
 def retry(source: str, state: str):
     """Retry all failed URLs for a source/state."""
     logger.info(f"Retrying failed URLs: source={source}, state={state}")
-    asyncio.run(_retry_single(source, state))
+    _run_command("retry", {"source": source, "state": state}, lambda: _retry_single(source, state))
 
 
-async def _retry_single(source: str, state: str) -> None:
+async def _retry_single(source: str, state: str) -> dict[str, int]:
     """Retry failed URLs for a single source/state."""
     from sqlalchemy import select
 
     from aevorex.db.models import ScrapeError
 
-    async with async_session_maker() as session: # type: ignore
-        try:
-            # Fetch all failed URLs for this source/state
-            query = select(ScrapeError).where(
-                (ScrapeError.source == source)
-                # Could filter by state if we store it in ScrapeError
-            )
-            result = await session.execute(query)
-            errors = result.scalars().all()
+    async with async_session_maker() as session:
+        query = select(ScrapeError).where(ScrapeError.source == source)
+        result = await session.execute(query)
+        errors = result.scalars().all()
 
-            if not errors:
-                logger.info(f"No failed URLs to retry for {source}/{state}")
-                return
+        if not errors:
+            logger.info("No failed URLs to retry for source=%s state=%s", source, state)
+            return {"queued": 0, "success": 0, "failed": 0}
 
-            logger.info(f"Found {len(errors)} failed URLs to retry")
+        logger.info("Retrying %s failed URL(s)", len(errors))
 
-            # Scrape them again
-            if source == "zillow":
-                from aevorex.scrapers.zillow import ZillowScraper
-                from aevorex.normalizers.zillow import ZillowNormalizer
-                scraper = ZillowScraper()
-                normalizer = ZillowNormalizer()
-            elif source == "redfin":
-                from aevorex.scrapers.redfin import RedfinScraper
-                from aevorex.normalizers.redfin import RedfinNormalizer
-                scraper = RedfinScraper()
-                normalizer = RedfinNormalizer()
-            elif source == "realtor":
-                from aevorex.scrapers.realtor import RealtorScraper
-                from aevorex.normalizers.realtor import RealtorNormalizer
-                scraper = RealtorScraper()
-                normalizer = RealtorNormalizer()
+        if source == "zillow":
+            from aevorex.normalizers.zillow import ZillowNormalizer
+            from aevorex.scrapers.zillow import ZillowScraper
 
-            from aevorex.pipeline.runner import PipelineRunner
+            scraper = ZillowScraper()
+            normalizer = ZillowNormalizer()
+        elif source == "redfin":
+            from aevorex.normalizers.redfin import RedfinNormalizer
+            from aevorex.scrapers.redfin import RedfinScraper
 
-            runner = PipelineRunner(scraper, normalizer)
+            scraper = RedfinScraper()
+            normalizer = RedfinNormalizer()
+        else:
+            from aevorex.normalizers.realtor import RealtorNormalizer
+            from aevorex.scrapers.realtor import RealtorScraper
 
-            urls = [err.url for err in errors]
-            result = await runner.run_scrape(session, state, urls=urls)
+            scraper = RealtorScraper()
+            normalizer = RealtorNormalizer()
 
-            logger.info(f"Retry result: {result['stats']['success']} succeeded, {result['stats']['failed']} failed")
+        from aevorex.pipeline.runner import PipelineRunner
 
-        except Exception as e:
-            logger.error(f"Error retrying {source}/{state}: {e}", exc_info=True)
+        runner = PipelineRunner(scraper, normalizer)
+        scrape_result = await runner.run_scrape(
+            session, state, urls=[error.url for error in errors]
+        )
+        stats = scrape_result["stats"]
+        logger.info("Retry completed: success=%s failed=%s", stats["success"], stats["failed"])
+        return {
+            "queued": len(errors),
+            "success": int(stats["success"]),
+            "failed": int(stats["failed"]),
+        }
 
 
 @cli.command()
 def scheduler():
     """Start the APScheduler job scheduler."""
     logger.info("Starting APScheduler...")
+    _run_command("scheduler", {}, _start_scheduler)
 
+
+async def _start_scheduler() -> dict[str, int]:
     if not settings.scheduler_enabled:
-        logger.error("Scheduler is disabled in config (SCHEDULER_ENABLED=false)")
-        return
+        raise RuntimeError("SchedulerDisabled")
 
     from aevorex.scheduler.jobs import start_scheduler
 
-    asyncio.run(start_scheduler())
+    await start_scheduler()
+    return {"stopped": 1}
 
 
 @cli.command("market-stats")
@@ -207,13 +220,13 @@ def market_stats():
     national threshold. Prefer `analyze`, which runs the three in order.
     """
     logger.info("Building market statistics...")
-    _run_stage(_build_market_stats())
+    _run_command("market-stats", {}, _build_market_stats)
 
 
 async def _build_market_stats() -> dict:
     from aevorex.market.stats import build_market_stats
 
-    async with async_session_maker() as session:  # type: ignore
+    async with async_session_maker() as session:
         stats = await build_market_stats(session)
         logger.info(
             "Market stats: %s cells written (%s sold, %s listing)",
@@ -234,13 +247,17 @@ def value(all_properties: bool, limit: int):
     property_valuation, which every scorer then reads. Prefer `analyze`.
     """
     logger.info("Starting valuation pass...")
-    _run_stage(_value_all(all_properties, limit))
+    _run_command(
+        "value",
+        {"all_properties": all_properties, "limit": limit},
+        lambda: _value_all(all_properties, limit),
+    )
 
 
 async def _value_all(all_properties: bool = False, limit: int = None) -> dict:
     from aevorex.valuation.engine import ValuationEngine
 
-    async with async_session_maker() as session:  # type: ignore
+    async with async_session_maker() as session:
         stats = await ValuationEngine().run(
             session, all_properties=all_properties, limit=limit
         )
@@ -262,14 +279,18 @@ def score(all_properties: bool):
     property_valuation and return NULL without it. Prefer `analyze`.
     """
     logger.info("Starting scoring run...")
-    _run_stage(_score_all(all_properties))
+    _run_command(
+        "score",
+        {"all_properties": all_properties},
+        lambda: _score_all(all_properties),
+    )
 
 
 async def _score_all(all_properties: bool = False) -> dict:
     """Run the scoring pass within a single session/transaction-per-property."""
     from aevorex.scoring.runner import ScoringRunner
 
-    async with async_session_maker() as session:  # type: ignore
+    async with async_session_maker() as session:
         stats = await ScoringRunner().run(session, all_properties=all_properties)
         logger.info(
             "Scoring result: total=%s scored=%s unvalued=%s errors=%s ranked=%s",
@@ -305,7 +326,14 @@ def analyze(all_properties: bool, skip_market_stats: bool):
     the flag is read by valuation and only then consumed by scoring.
     """
     logger.info("Starting full analysis chain...")
-    _run_stage(_analyze_all(all_properties, skip_market_stats))
+    _run_command(
+        "analyze",
+        {
+            "all_properties": all_properties,
+            "skip_market_stats": skip_market_stats,
+        },
+        lambda: _analyze_all(all_properties, skip_market_stats),
+    )
 
 
 async def _analyze_all(all_properties: bool = False,
@@ -326,26 +354,46 @@ async def _analyze_all(all_properties: bool = False,
     return results
 
 
-def _run_stage(coro) -> None:
-    """
-    Drive one async stage, and exit non-zero if it fails.
+def _run_command(
+    kind: str,
+    scope: Mapping[str, JsonValue],
+    operation: Callable[[], Awaitable[T]],
+) -> T:
+    """Run one CLI operation with a durable ledger row and sanitized failure."""
+    async def execute() -> T:
+        try:
+            return await tracked(kind, scope, operation)
+        finally:
+            await close_engine()
 
-    The stages used to swallow their own exceptions and log them, which meant
-    a chained run would carry on past a broken stage and a CI or cron caller
-    would see success. A failed stage must stop the chain.
-    """
     try:
-        asyncio.run(coro)
-    except Exception as e:
-        logger.error("Stage failed: %s", e, exc_info=True)
-        sys.exit(1)
+        return asyncio.run(execute())
+    except Exception as exc:
+        error_class = type(exc).__name__
+        logger.error("Command failed: kind=%s error_class=%s", kind, error_class)
+        raise click.ClickException(f"Command failed ({error_class})") from None
 
 
 @cli.command()
 def init_db():
     """Initialize database (run migrations)."""
-    logger.info("Initializing database...")
-    logger.info("Run: alembic upgrade head")
+    from alembic import command
+    from alembic.config import Config
+
+    logger.info("Applying local Alembic migrations...")
+    try:
+        command.upgrade(Config("alembic.ini"), "head")
+    except Exception as exc:
+        error_class = type(exc).__name__
+        logger.error("Database initialization failed: error_class=%s", error_class)
+        raise click.ClickException(
+            f"Database initialization failed ({error_class})"
+        ) from None
+
+    async def completed() -> dict[str, int]:
+        return {"migrations_applied": 1}
+
+    _run_command("init-db", {}, completed)
 
 
 if __name__ == "__main__":
