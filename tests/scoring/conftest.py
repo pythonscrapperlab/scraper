@@ -18,7 +18,6 @@ from aevorex.db.models import (
     PriceHistory,
     Property,
     PropertyComp,
-    PropertyFeature,
     PropertyValuation,
     TaxHistory,
 )

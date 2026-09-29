@@ -29,15 +29,15 @@ class RealtorScraper(BaseScraper):
         urls = []
         
         # Example: FL search
-        search_url = f"{self.base_url}/homes/for_sale/{state}/"
+        _search_url = f"{self.base_url}/homes/for_sale/{state}/"
         
         client = HttpClient()
         try:
             # Fetch search page
             # Extract property URLs
             pass
-        except Exception as e:
-            print(f"Error fetching listing URLs: {e}")
+        except Exception as exc:
+            self.logger.error("Listing discovery failed: error_class=%s", type(exc).__name__)
         finally:
             await client.close()
         
@@ -57,8 +57,8 @@ class RealtorScraper(BaseScraper):
         try:
             response = await client.get_text(url)
             return response
-        except Exception as e:
-            print(f"Error fetching {url}: {e}")
+        except Exception as exc:
+            self.logger.error("Listing fetch failed: error_class=%s", type(exc).__name__)
             return None
         finally:
             await client.close()
@@ -107,6 +107,6 @@ class RealtorScraper(BaseScraper):
             }
             
             return parsed
-        except Exception as e:
-            print(f"Error parsing Realtor data: {e}")
+        except Exception as exc:
+            self.logger.error("Listing parse failed: error_class=%s", type(exc).__name__)
             return None

@@ -1,9 +1,11 @@
 """Zillow normalizer — maps Zillow __NEXT_DATA__ to properties schema."""
 
-from datetime import datetime
+import logging
 from typing import Any, Dict, Optional
 
 from aevorex.normalizers.base import BaseNormalizer
+
+logger = logging.getLogger(__name__)
 
 
 class ZillowNormalizer(BaseNormalizer):
@@ -76,6 +78,6 @@ class ZillowNormalizer(BaseNormalizer):
             
             return normalized
             
-        except Exception as e:
-            print(f"Error normalizing Zillow data: {e}")
+        except Exception as exc:
+            logger.error("Zillow normalization failed: error_class=%s", type(exc).__name__)
             return None

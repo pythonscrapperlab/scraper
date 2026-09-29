@@ -33,9 +33,8 @@ it is not this migration's job.
 """
 import logging
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = 'b7e2d94c5a11'
@@ -55,7 +54,7 @@ UNIQUE_INDEX_COLUMNS = (
 # statement and needs no surrogate ordering column). Every column the unique
 # index keys on is equal across the group, so which one survives is
 # immaterial — only the count changes.
-DEDUPE_SQL = f"""
+DEDUPE_SQL = """
     DELETE FROM price_history a
     USING price_history b
     WHERE a.ctid > b.ctid

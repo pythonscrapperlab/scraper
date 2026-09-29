@@ -3,9 +3,9 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import URL, pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from aevorex.config import settings
 from aevorex.db.models import Base
@@ -60,9 +60,16 @@ def include_object(obj, name, type_, reflected, compare_to):
     return True
 
 
-def get_database_url():
+def get_database_url() -> URL:
     """Get async PostgreSQL URL from settings."""
-    return f"postgresql+asyncpg://{settings.db_user}:{settings.db_password}@{settings.db_host}:{settings.db_port}/{settings.db_name}"
+    return URL.create(
+        "postgresql+asyncpg",
+        username=settings.db_user,
+        password=settings.db_password.get_secret_value(),
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+    )
 
 
 def run_migrations_offline() -> None:
@@ -110,7 +117,9 @@ async def run_migrations_online() -> None:
     and associate a connection with the context.
     """
     configuration = config.get_section(config.config_ini_section)
-    configuration["sqlalchemy.url"] = get_database_url()
+    configuration["sqlalchemy.url"] = get_database_url().render_as_string(
+        hide_password=False
+    )
 
     connectable = create_async_engine(
         get_database_url(),

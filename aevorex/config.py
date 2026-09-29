@@ -4,10 +4,8 @@ Centralized configuration for Aevorex scraper.
 Loads from environment variables with sensible defaults for local development.
 """
 
-from typing import List, Optional
-
-from pydantic import Field, ConfigDict, computed_field
-from pydantic_settings import BaseSettings
+from pydantic import Field, SecretStr, computed_field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -18,7 +16,7 @@ class Settings(BaseSettings):
     db_port: int = 5432
     db_name: str = "aevorex_db"
     db_user: str = "aevorex"
-    db_password: str = "aevorex123!"
+    db_password: SecretStr
     db_echo: bool = False  # Log SQL queries
     db_pool_size: int = 20
     db_max_overflow: int = 10
@@ -45,11 +43,16 @@ class Settings(BaseSettings):
     selenium_timeout: int = 30  # seconds
 
     # === Transport: Proxies ===
-    proxy_enabled: bool = True  # Disabled by default
+    proxy_enabled: bool = False
     proxy_provider: str = "webshare"  # brightdata | oxylabs | smartproxy | webshare | dataimpulse
-    proxy_user: Optional[str] = "zoroupwork-US-rotate"
-    proxy_password: Optional[str] = "burhanburhan"
-    proxy_zone: Optional[str] = "US"
+    proxy_user: SecretStr
+    proxy_password: SecretStr
+    proxy_zone: str | None = "US"
+
+    # === Supabase publishing target ===
+    supabase_project_url: str | None = None
+    supabase_publishable_key: SecretStr | None = None
+    supabase_direct_connection_url: SecretStr | None = None
 
     # === Scraping: Zillow ===
     zillow_enabled: bool = True
@@ -81,18 +84,19 @@ class Settings(BaseSettings):
 
     # === Logging ===
     log_level: str = "INFO"
-    log_file: Optional[str] = "logs/aevorex.log"
+    log_file: str | None = "logs/aevorex.log"
 
     @computed_field  # type: ignore
     @property
-    def target_states(self) -> List[str]:
+    def target_states(self) -> list[str]:
         """Get target_states as a list."""
         return [s.strip() for s in self.target_states_str.split(",") if s.strip()]
 
-    model_config = ConfigDict(
+    model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
 

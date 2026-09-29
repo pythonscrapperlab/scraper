@@ -206,11 +206,8 @@ class RedfinNormalizer(BaseNormalizer):
 
             return normalized
 
-        except Exception:
-            logger.exception(
-                "Error normalizing Redfin data for %s",
-                platform_dict.get("listing_url") or platform_dict.get("redfin_id"),
-            )
+        except Exception as exc:
+            logger.error("Redfin normalization failed: error_class=%s", type(exc).__name__)
             return None
 
     # ------------------------------------------------------------------

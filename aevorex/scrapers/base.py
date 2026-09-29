@@ -1,12 +1,12 @@
 """Base scraper class that all platform scrapers inherit from."""
-import logging
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
 import html
+import logging
 import re
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 from dateutil import parser as dateutil_parser
-import json
 
 
 class BaseScraper(ABC):

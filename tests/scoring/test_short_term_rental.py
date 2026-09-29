@@ -6,7 +6,6 @@ strategy as nightly letting: a 55+ community helps here and disqualifies
 there, and the regulatory burden is fundamentally different.
 """
 
-import pytest
 
 from aevorex.scoring.short_term_rental import MidTermRentalScorer
 from tests.scoring.conftest import (

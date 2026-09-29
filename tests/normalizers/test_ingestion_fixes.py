@@ -6,8 +6,8 @@ Each test names the specific wrong number it prevents from coming back.
 
 from datetime import datetime
 
-from aevorex.db.event_types import INCREASED, PRICE_CHANGED, REDUCED
 from aevorex.db.deduplicator import Deduplicator
+from aevorex.db.event_types import INCREASED, PRICE_CHANGED, REDUCED
 from aevorex.db.models import Property
 from aevorex.normalizers.redfin import RedfinNormalizer
 

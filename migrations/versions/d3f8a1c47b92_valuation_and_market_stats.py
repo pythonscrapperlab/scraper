@@ -15,9 +15,8 @@ Strictly additive. No existing row is read, rewritten or deleted.
 """
 import logging
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = 'd3f8a1c47b92'

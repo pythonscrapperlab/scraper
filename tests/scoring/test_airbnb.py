@@ -6,7 +6,6 @@ that can be out-voted by a high enough demand score is not a gate, and would
 send an investor at a property they legally cannot operate.
 """
 
-import pytest
 
 from aevorex.scoring.airbnb import PROXY_FLAG, UNVERIFIED_FLAG, AirbnbScorer
 from aevorex.scoring.config import AirbnbConfig, ScoringConfig

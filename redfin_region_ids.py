@@ -21,13 +21,16 @@ Usage:
 import argparse
 import csv
 import json
+import os
 import random
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 
 import requests
+from dotenv import load_dotenv
 
 AUTOCOMPLETE = "https://www.redfin.com/stingray/do/location-autocomplete"
 
@@ -44,10 +47,16 @@ HEADERS = {
 # /city/13655/FL/Orlando  ->  ("13655", "FL", "Orlando")
 CITY_URL = re.compile(r"^/city/(\d+)/([A-Z]{2})/([^/?#]+)")
 
-PROXIES = {
-    "http": "http://zoroupwork-US-rotate:burhanburhan@p.webshare.io:80",
-    "https": "http://zoroupwork-US-rotate:burhanburhan@p.webshare.io:80",
-}  # e.g. {"https": "http://user:pass@us-residential-proxy:port"}
+load_dotenv()
+_proxy_user = os.environ.get("PROXY_USER")
+_proxy_password = os.environ.get("PROXY_PASSWORD")
+if not _proxy_user or not _proxy_password:
+    raise RuntimeError("PROXY_USER and PROXY_PASSWORD are required")
+_proxy_url = (
+    f"http://{quote(_proxy_user, safe='')}:{quote(_proxy_password, safe='')}"
+    "@p.webshare.io:80"
+)
+PROXIES = {"http": _proxy_url, "https": _proxy_url}
 
 
 # ---------------------------------------------------------------- helpers

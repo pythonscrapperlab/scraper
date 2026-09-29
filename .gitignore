@@ -41,6 +41,8 @@ env/
 .env
 .env.local
 .env.*.local
+*.env
+!.env.example
 
 # Database
 *.db
@@ -70,3 +72,9 @@ package-lock.json
 */venv
 # Local DB backups (large binary dumps)
 backups/
+
+*tmp
+*docs
+*output
+old.env
+raw.ipynb

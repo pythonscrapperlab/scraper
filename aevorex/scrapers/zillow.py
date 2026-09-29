@@ -1,6 +1,5 @@
 """Zillow scraper — extracts __NEXT_DATA__ JSON using Playwright."""
 
-import json
 from typing import Any, Dict, List, Optional
 
 from aevorex.config import settings
@@ -39,14 +38,14 @@ class ZillowScraper(BaseScraper):
         async with PlaywrightBrowser() as browser:
             try:
                 # Fetch search page
-                html = await browser.fetch_html(search_url)
+                await browser.fetch_html(search_url)
                 
                 # Extract property URLs from __NEXT_DATA__
                 # Parse listings from JSON
                 # Return list of URLs
                 
-            except Exception as e:
-                print(f"Error fetching listing URLs: {e}")
+            except Exception as exc:
+                self.logger.error("Listing discovery failed: error_class=%s", type(exc).__name__)
         
         return urls
 
@@ -67,8 +66,8 @@ class ZillowScraper(BaseScraper):
                     selector='script[type="application/json"]',
                 )
                 return json_data
-        except Exception as e:
-            print(f"Error fetching {url}: {e}")
+        except Exception as exc:
+            self.logger.error("Listing fetch failed: error_class=%s", type(exc).__name__)
             return None
 
     async def parse(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -116,6 +115,6 @@ class ZillowScraper(BaseScraper):
             }
             
             return parsed
-        except Exception as e:
-            print(f"Error parsing Zillow data: {e}")
+        except Exception as exc:
+            self.logger.error("Listing parse failed: error_class=%s", type(exc).__name__)
             return None

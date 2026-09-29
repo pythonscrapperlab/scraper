@@ -63,8 +63,12 @@ class ScraperJobs:
         for state in settings.target_states:
             try:
                 await _scrape_single("zillow", state)
-            except Exception as e:
-                logger.error(f"Error scraping Zillow for {state}: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Scheduled Zillow scrape failed: state=%s error_class=%s",
+                    state,
+                    type(exc).__name__,
+                )
 
     async def _scrape_redfin(self):
         """Redfin scraper job."""
@@ -74,8 +78,12 @@ class ScraperJobs:
         for state in settings.target_states:
             try:
                 await _scrape_single("redfin", state)
-            except Exception as e:
-                logger.error(f"Error scraping Redfin for {state}: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Scheduled Redfin scrape failed: state=%s error_class=%s",
+                    state,
+                    type(exc).__name__,
+                )
 
     async def _scrape_realtor(self):
         """Realtor scraper job."""
@@ -85,8 +93,12 @@ class ScraperJobs:
         for state in settings.target_states:
             try:
                 await _scrape_single("realtor", state)
-            except Exception as e:
-                logger.error(f"Error scraping Realtor for {state}: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Scheduled Realtor scrape failed: state=%s error_class=%s",
+                    state,
+                    type(exc).__name__,
+                )
 
     async def _run_analysis(self):
         """
@@ -104,8 +116,8 @@ class ScraperJobs:
 
         try:
             await _analyze_all()
-        except Exception as e:
-            logger.error(f"Error running analysis job: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Scheduled analysis failed: error_class=%s", type(exc).__name__)
 
     def start(self):
         """Start scheduler."""

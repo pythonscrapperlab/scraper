@@ -1,6 +1,5 @@
 """Motivated-seller scorer: seller pressure, ranked."""
 
-from datetime import datetime
 
 import pytest
 

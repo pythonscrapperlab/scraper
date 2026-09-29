@@ -1,8 +1,11 @@
 """Test normalizer — mock implementation."""
 
+import logging
 from typing import Any, Dict, Optional
 
 from aevorex.normalizers.base import BaseNormalizer
+
+logger = logging.getLogger(__name__)
 
 
 class TestNormalizer(BaseNormalizer):
@@ -58,6 +61,6 @@ class TestNormalizer(BaseNormalizer):
 
             return normalized
 
-        except Exception as e:
-            print(f"Error normalizing test data: {e}")
+        except Exception as exc:
+            logger.error("Test normalization failed: error_class=%s", type(exc).__name__)
             return None

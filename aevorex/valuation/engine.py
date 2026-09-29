@@ -14,7 +14,7 @@ fail, its $/sqft.
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aevorex.db.models import Property, PropertyComp, PropertyFeature, PropertyValuation
@@ -97,9 +97,9 @@ class ValuationEngine:
                 stats["valued"] += 1
                 if valued.get("market_value") is None:
                     stats["no_value"] += 1
-            except Exception:
+            except Exception as exc:
                 stats["errors"] += 1
-                logger.error("Failed to value property %s", prop.id, exc_info=True)
+                logger.error("Valuation failed: error_class=%s", type(exc).__name__)
 
             # Batch commits: per-property would be 7,300 round trips, one
             # commit at the end would lose the whole run on a single failure.

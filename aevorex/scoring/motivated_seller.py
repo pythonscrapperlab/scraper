@@ -36,7 +36,6 @@ from typing import List, Optional
 from aevorex.db.event_types import OFF_MARKET_TYPES, REDUCED, RELISTED
 from aevorex.scoring.base import BaseScorer, ScoreResult, ScoringContext
 from aevorex.scoring.curves import (
-    apply_gate,
     clamp,
     confidence_adjusted,
     linear_ramp,

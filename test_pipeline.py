@@ -14,7 +14,6 @@ Run: python test_pipeline.py
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 
 # Configure logging
 logging.basicConfig(
@@ -34,9 +33,9 @@ async def test_pipeline():
     try:
         # Import after logging is configured
         from aevorex.db import async_session_maker, close_engine
-        from aevorex.scrapers.test import TestScraper
         from aevorex.normalizers.test import TestNormalizer
         from aevorex.pipeline.runner import PipelineRunner
+        from aevorex.scrapers.test import TestScraper
 
         logger.info("\n✓ Imports successful")
 
@@ -81,14 +80,15 @@ async def test_pipeline():
         logger.info(f"Properties updated: {result['updated']}")
 
         if result["errors"]:
-            logger.warning(f"\n⚠️  Errors encountered:")
+            logger.warning("\n⚠️  Errors encountered:")
             for i, error in enumerate(result["errors"], 1):
                 logger.warning(f"  {i}. {error}")
 
         # Verify data in database
         logger.info("\n✅ Verifying data in database...")
         async with async_session_maker() as session:
-            from sqlalchemy import select, func
+            from sqlalchemy import func, select
+
             from aevorex.db.models import Property, RawScrape
 
             prop_count = await session.execute(select(func.count(Property.id)))
@@ -106,7 +106,7 @@ async def test_pipeline():
                 props_result = await session.execute(props_query)
                 first_prop = props_result.scalar_one_or_none()
                 if first_prop:
-                    logger.info(f"\n📍 First property:")
+                    logger.info("\n📍 First property:")
                     logger.info(f"   Address: {first_prop.address}")
                     logger.info(f"   City: {first_prop.city}")
                     logger.info(f"   Price: ${first_prop.price:,}")

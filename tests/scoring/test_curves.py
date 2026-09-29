@@ -22,7 +22,6 @@ from aevorex.scoring.curves import (
     weighted_blend,
 )
 
-
 # ---------------------------------------------------------------- monotonic
 
 

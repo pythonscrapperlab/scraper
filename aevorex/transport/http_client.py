@@ -1,11 +1,9 @@
 """HTTP transport layer using httpx with retries and resilience."""
 
-import asyncio
 from typing import Any, Dict, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
-from aevorex.transport.proxy_manager import ProxyManager
 
 from aevorex.config import settings
 
@@ -134,7 +132,7 @@ class HttpClient:
         try:
             response = await self.get(url, headers=headers, **kwargs)
             return response.text if response else None
-        except Exception as e:
+        except Exception:
             raise
 
     async def get_json(
@@ -144,7 +142,7 @@ class HttpClient:
         try:
             response = await self.get(url, headers=headers, **kwargs)
             return response.json() if response else None
-        except Exception as e:
+        except Exception:
             raise
 
 

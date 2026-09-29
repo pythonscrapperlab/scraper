@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
+    UUID,
     Boolean,
     Column,
     Date,
@@ -22,10 +23,10 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UUID,
     false,
     true,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -34,6 +35,24 @@ Base = declarative_base()
 def utc_now() -> datetime:
     """Return current UTC timestamp."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class Run(Base):
+    """One durable, PII-free execution record per CLI invocation."""
+
+    __tablename__ = "runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    kind = Column(String(50), nullable=False, index=True)
+    scope = Column(JSONB, nullable=False, default=dict)
+    started_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
+    finished_at = Column(DateTime(timezone=False), nullable=True)
+    status = Column(String(20), nullable=False, default="running", index=True)
+    counts = Column(JSONB, nullable=False, default=dict)
+    error_class = Column(String(255), nullable=True)
+    duration_s = Column(Float, nullable=True)
+
+    __table_args__ = (Index("idx_runs_kind_started", "kind", "started_at"),)
 
 
 class RawScrape(Base):
@@ -671,6 +690,7 @@ class PropertyAnalysis(Base):
     motivated_seller_rationale = Column(Text, nullable=True)
     motivated_seller_factors = Column(JSON, nullable=True)
     motivated_seller_flags = Column(JSON, nullable=True)  # list of data-quality flag strings
+    motivated_seller_breakdown = Column(JSONB, nullable=True)
 
     fix_flip_score = Column(Float, nullable=True, index=True)
     fix_flip_percentile = Column(Float, nullable=True, index=True)
@@ -678,6 +698,7 @@ class PropertyAnalysis(Base):
     fix_flip_rationale = Column(Text, nullable=True)
     fix_flip_factors = Column(JSON, nullable=True)
     fix_flip_flags = Column(JSON, nullable=True)
+    fix_flip_breakdown = Column(JSONB, nullable=True)
 
     buy_hold_score = Column(Float, nullable=True, index=True)
     buy_hold_percentile = Column(Float, nullable=True, index=True)
@@ -685,6 +706,7 @@ class PropertyAnalysis(Base):
     buy_hold_rationale = Column(Text, nullable=True)
     buy_hold_factors = Column(JSON, nullable=True)
     buy_hold_flags = Column(JSON, nullable=True)
+    buy_hold_breakdown = Column(JSONB, nullable=True)
 
     # Mid-term / snowbird letting, 30+ days.
     str_score = Column(Float, nullable=True, index=True)
@@ -693,6 +715,7 @@ class PropertyAnalysis(Base):
     str_rationale = Column(Text, nullable=True)
     str_factors = Column(JSON, nullable=True)
     str_flags = Column(JSON, nullable=True)
+    str_breakdown = Column(JSONB, nullable=True)
 
     # Nightly vacation letting, under 30 days.
     airbnb_score = Column(Float, nullable=True, index=True)
@@ -701,6 +724,7 @@ class PropertyAnalysis(Base):
     airbnb_rationale = Column(Text, nullable=True)
     airbnb_factors = Column(JSON, nullable=True)
     airbnb_flags = Column(JSON, nullable=True)
+    airbnb_breakdown = Column(JSONB, nullable=True)
 
     # Tags which ScoringConfig.CONFIG_VERSION produced these scores, so a
     # weight/threshold change can be traced against which rows are stale.

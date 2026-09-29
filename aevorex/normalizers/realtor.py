@@ -1,8 +1,11 @@
 """Realtor normalizer — maps Realtor.com JSON-LD to properties schema."""
 
+import logging
 from typing import Any, Dict, Optional
 
 from aevorex.normalizers.base import BaseNormalizer
+
+logger = logging.getLogger(__name__)
 
 
 class RealtorNormalizer(BaseNormalizer):
@@ -76,6 +79,6 @@ class RealtorNormalizer(BaseNormalizer):
             
             return normalized
             
-        except Exception as e:
-            print(f"Error normalizing Realtor data: {e}")
+        except Exception as exc:
+            logger.error("Realtor normalization failed: error_class=%s", type(exc).__name__)
             return None

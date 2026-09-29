@@ -1,21 +1,20 @@
 """Redfin scraper — uses internal Redfin API endpoints with httpx."""
 
+import asyncio
+import json
+import math
+import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from bs4 import BeautifulSoup
 
 from aevorex.config import settings
 from aevorex.scrapers.base import BaseScraper
+from aevorex.scrapers.constants import REDFIN
 from aevorex.transport.http_client import HttpClient
 from aevorex.transport.proxy_manager import ProxyManager
-from aevorex.scrapers.constants import REDFIN
-import math
-import asyncio
-from datetime import datetime, timezone
-import html
-import re
-from dateutil import parser as dateutil_parser
-import json
+
 
 class RedfinScraper(BaseScraper):
     """
@@ -94,12 +93,17 @@ class RedfinScraper(BaseScraper):
                 res = await client.get_text(page_url)
                 return self._parse_homecards(res)  # type: ignore
             except Exception as e:
-                self.logger.warning(f"Attempt {i+1}: Failed to fetch page {page} for {url}: {e}")
+                self.logger.warning(
+                    "Search-page fetch failed: page=%s attempt=%s error_class=%s",
+                    page,
+                    i + 1,
+                    type(e).__name__,
+                )
                 await asyncio.sleep(2)  # Wait before retrying
                 
             client = self._new_client()
         
-        self.logger.error(f"Failed to fetch page {page} for {url} after 3 attempts.")
+        self.logger.error("Search-page fetch exhausted retries: page=%s", page)
         return []
 
     async def get_property_urls(self, url: str) -> List[str]:
@@ -129,7 +133,11 @@ class RedfinScraper(BaseScraper):
             except Exception:
                 total_pages = 1
             # total_pages = 2
-            print(f"Found {total_properties} properties across {total_pages} pages for {url}")
+            self.logger.info(
+                "Search inventory discovered: properties=%s pages=%s",
+                total_properties,
+                total_pages,
+            )
             
             # if total_pages >20:
             #     self.logger.warning(f"Redfin search {url} has {total_pages} pages, which exceeds the limit of 20. Only fetching the first 20 pages.")
@@ -163,7 +171,7 @@ class RedfinScraper(BaseScraper):
         urls = self.get_state_urls(state, city)
         property_urls = []
         for url in urls:
-            self.logger.info(f"Fetching property URLs from: {url}")
+            self.logger.info("Fetching property URLs for source market")
             new_urls = await self.get_property_urls(url)
             property_urls.extend(new_urls)
         self.logger.info(f"Found {len(property_urls)} property URLs for {state}, {city}")
@@ -203,13 +211,17 @@ class RedfinScraper(BaseScraper):
             client = self._new_client()
             try:
                 # Property page — return HTML
-                self.logger.info(f"Fetching Redfin property page: {url}")
+                self.logger.debug("Fetching Redfin property page")
                 response = await client.get_text(url, headers=headers)
                 return response # type: ignore
             except Exception as e:
-                self.logger.warning(f"Attempt {i+1}: Failed to fetch {url}: {e}")
+                self.logger.warning(
+                    "Property fetch failed: attempt=%s error_class=%s",
+                    i + 1,
+                    type(e).__name__,
+                )
                 await asyncio.sleep(2)  # Wait before retrying
-        self.logger.error(f"Failed to fetch {url} after 3 attempts.")
+        self.logger.error("Property fetch exhausted retries")
         await client.close()
         return None
 
@@ -230,7 +242,7 @@ class RedfinScraper(BaseScraper):
         try:
             script = [i for i in soup.findAll("script", {"type":"application/ld+json"}) if "RealEstateListing" in i.text][0]
             data = json.loads(script.text)
-        except:
+        except Exception:
             data = {}
 
         redfin_id = data.get("url", "").split("/")[-1]
