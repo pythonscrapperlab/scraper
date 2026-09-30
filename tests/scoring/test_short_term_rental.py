@@ -6,7 +6,6 @@ strategy as nightly letting: a 55+ community helps here and disqualifies
 there, and the regulatory burden is fundamentally different.
 """
 
-
 from aevorex.scoring.short_term_rental import MidTermRentalScorer
 from tests.scoring.conftest import (
     make_amenities,
@@ -58,8 +57,9 @@ def test_rationale_states_the_30_day_regulatory_position():
 def test_revenue_model_accounts_for_the_seasonal_void():
     result = scorer.score(make_context(location_score=make_location_score()))
     f = result.factors
-    assert f["occupied_months"] < 12, "snowbird season is not a full year"
-    assert f["monthly_rent_mid_term"] > f["monthly_rent_long_term"], "furnished commands a premium"
+    assert f["vacant_months"] > 0, "snowbird season is not a full year"
+    assert f["season_months"] + f["shoulder_months"] < 12
+    assert f["in_season_monthly_rent"] > f["monthly_rent_long_term"], "furnished commands a premium"
     assert f["net_annual_income"] < f["gross_seasonal_revenue"], "costs must be deducted"
 
 

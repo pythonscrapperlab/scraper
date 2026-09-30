@@ -75,6 +75,10 @@ backups/
 
 *tmp
 *docs
+!docs/
+docs/*
+!docs/breakdown/
+!docs/breakdown/*.md
 *output
 old.env
 raw.ipynb

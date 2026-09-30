@@ -6,9 +6,10 @@ already-loaded ScoringContext, which is what keeps the scorers themselves
 easy to unit test without a live DB (see tests/scoring/).
 """
 
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from statistics import median
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from aevorex.db.event_types import (
     LISTED,
@@ -278,3 +279,156 @@ def location_score_avg(location_score, fields: Sequence[str]) -> Optional[float]
     if not values:
         return None
     return sum(values) / len(values)
+
+
+# ------------------------------------------------------------------
+# listing-cycle, equity and churn helpers (motivated seller)
+# ------------------------------------------------------------------
+
+
+def current_listing_cycle(price_history: List[PriceHistory]) -> List[PriceHistory]:
+    """
+    Sale-side events belonging to the CURRENT listing only.
+
+    A property's history spans every time it was ever listed. Counting price
+    cuts across all of it and dividing by the current days on market produced
+    "2.0 cuts per 30 days" on a listing three days old whose last cut was in
+    2019. The cycle starts at the most recent listed/relisted event; if there
+    is none, the whole sale-side history is returned so a property with a
+    thin history is not scored as having none.
+    """
+    events = sale_events(price_history)
+    start_index = None
+    for index, event in enumerate(events):
+        if event_kind(event) in (LISTED, RELISTED):
+            start_index = index
+    if start_index is None:
+        return events
+    return events[start_index:]
+
+
+def last_sale(price_history: List[PriceHistory]) -> Optional[Tuple[int, datetime]]:
+    """
+    Most recent sold event with a real price, as (price, date).
+
+    Nominal transfers ($100 quitclaims, $10 family deeds) are excluded; they
+    are real events but say nothing about what the owner paid.
+    """
+    sold = [
+        e for e in sale_events(price_history)
+        if event_kind(e) == "sold" and e.price and e.price >= 10_000 and e.event_date
+    ]
+    if not sold:
+        return None
+    latest = max(sold, key=lambda e: e.event_date)
+    return int(latest.price), latest.event_date
+
+
+def listing_runs(price_history: List[PriceHistory], window_months: int) -> int:
+    """
+    Distinct MLS listing numbers on listed/relisted events within the window.
+
+    Redfin's `sourceId` is the MLS listing number and repeats within one
+    listing agreement, so a change in it marks a new agreement — usually a
+    new agent. Three or more inside three years is a seller cycling agents.
+    """
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30 * window_months)
+    ids = set()
+    for e in sale_events(price_history):
+        if event_kind(e) in (LISTED, RELISTED) and e.event_date and e.event_date >= cutoff:
+            source_id = getattr(e, "source_event_id", None)
+            if source_id:
+                ids.add(source_id)
+    return len(ids)
+
+
+# ------------------------------------------------------------------
+# property-type and points-of-interest helpers
+# ------------------------------------------------------------------
+
+
+def is_attached(property_type: Optional[str]) -> bool:
+    text = (property_type or "").lower()
+    return any(t in text for t in ("condo", "co-op", "townhouse", "townhome"))
+
+
+def is_condo(property_type: Optional[str]) -> bool:
+    text = (property_type or "").lower()
+    return "condo" in text or "co-op" in text
+
+
+_HOSPITAL = re.compile(r"\b(hospital|medical center|regional medical|health center)\b", re.I)
+_NOT_HUMAN_HOSPITAL = re.compile(r"\b(animal|pet|veterinar\w*|vet|equine|wildlife|dental)\b", re.I)
+_BEACH = re.compile(r"\bbeach\b(?!\s+(blvd|boulevard|rd|road|ave|avenue|dr|drive|st|street|way|hwy|highway|club|plaza|mall|market|shop|store|grill|cafe|bar|pub))", re.I)
+_THEME_PARK = re.compile(r"disney|universal (studios|orlando|citywalk)|epcot|magic kingdom|seaworld|sea world|animal kingdom|hollywood studios|islands of adventure|volcano bay|busch gardens|legoland", re.I)
+
+
+def nearest_poi_distance(pois, pattern, exclude=None) -> Optional[float]:
+    """Distance in miles to the nearest POI whose name matches, or None."""
+    best = None
+    for name, distance in pois or []:
+        if not name or distance is None:
+            continue
+        if not pattern.search(name):
+            continue
+        if exclude is not None and exclude.search(name):
+            continue
+        if best is None or distance < best:
+            best = float(distance)
+    return best
+
+
+def nearest_hospital_miles(pois) -> Optional[float]:
+    return nearest_poi_distance(pois, _HOSPITAL, exclude=_NOT_HUMAN_HOSPITAL)
+
+
+def nearest_beach_miles(pois) -> Optional[float]:
+    return nearest_poi_distance(pois, _BEACH)
+
+
+def nearest_theme_park_miles(pois) -> Optional[float]:
+    return nearest_poi_distance(pois, _THEME_PARK)
+
+
+# ------------------------------------------------------------------
+# Florida condo-risk text signals (buy & hold)
+# ------------------------------------------------------------------
+
+_SPECIAL_ASSESSMENT = re.compile(r"\bspecial\s+assessments?\b", re.I)
+_RESERVE_OR_MILESTONE = re.compile(
+    r"\bmilestone\s+inspection|\bSIRS\b|structural\s+integrity\s+reserve|"
+    r"\b40[- ]year\s+(re)?certif|\breserve\s+study\b|\bunderfunded\s+reserves?\b", re.I
+)
+_CONDO_HOTEL = re.compile(
+    r"condo[- ]?hotel|condotel|\bresort\s+(condo|unit|residence|community|style)|"
+    r"hotel[- ]condo|\bnightly\s+rental\s+program|\bon-?site\s+rental\s+program", re.I
+)
+_ASSESSMENT_PAID = re.compile(r"assessments?\s+(has\s+been\s+|have\s+been\s+|is\s+|are\s+)?(paid|fully\s+paid|paid\s+in\s+full)", re.I)
+
+
+def condo_risk_text_signals(*texts: Optional[str]) -> Dict[str, bool]:
+    """
+    Association-health language from the remarks.
+
+    A paid-off assessment is disclosed as a positive ("special assessment
+    paid in full") and must not read as a live one, so the paid form is
+    checked first.
+    """
+    blob = " ".join(t for t in texts if t)
+    if not blob.strip():
+        return {"special_assessment": False, "reserve_or_milestone": False,
+                "condo_hotel": False, "assessment_paid": False}
+    paid = bool(_ASSESSMENT_PAID.search(blob))
+    return {
+        "special_assessment": bool(_SPECIAL_ASSESSMENT.search(blob)) and not paid,
+        "reserve_or_milestone": bool(_RESERVE_OR_MILESTONE.search(blob)),
+        "condo_hotel": bool(_CONDO_HOTEL.search(blob)),
+        "assessment_paid": paid,
+    }
+
+
+def looks_like_condo_hotel(address: Optional[str], *texts: Optional[str]) -> bool:
+    """Resort/condo-hotel detection from the address as well as the remarks."""
+    if address and re.search(r"\bresort\b", address, re.I):
+        return True
+    return condo_risk_text_signals(*texts)["condo_hotel"]
