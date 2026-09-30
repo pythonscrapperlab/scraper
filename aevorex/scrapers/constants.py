@@ -1,6 +1,7 @@
 REDFIN = {
     "FL": {
         "Orlando": 13655,
+        "Vero-Beach": 18840,
         # "Miami": 11458,
         # "Tampa": 18142,
         # "Jacksonville": 8907,

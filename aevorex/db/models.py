@@ -23,6 +23,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     false,
     true,
 )
@@ -53,6 +54,106 @@ class Run(Base):
     duration_s = Column(Float, nullable=True)
 
     __table_args__ = (Index("idx_runs_kind_started", "kind", "started_at"),)
+
+
+class MarketFreshness(Base):
+    """Local truth for the last complete search/detail pass for one market."""
+
+    __tablename__ = "market_freshness"
+
+    slug = Column(String(160), primary_key=True)
+    city = Column(String(100), nullable=False)
+    state = Column(String(2), nullable=False)
+    region_id = Column(String(50), nullable=False)
+    last_checked_at = Column(DateTime(timezone=False), nullable=True)
+    next_check_at = Column(DateTime(timezone=False), nullable=True)
+    last_refreshed_at = Column(DateTime(timezone=False), nullable=True)
+    check_status = Column(String(20), nullable=False, default="warming")
+    listings_active = Column(Integer, nullable=False, default=0)
+    changed_last_check = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=False), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+class ListingPresence(Base):
+    """Latest complete-search observation and consecutive-absence state."""
+
+    __tablename__ = "listing_presence"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    market_slug = Column(String(160), ForeignKey("market_freshness.slug"), nullable=False)
+    redfin_id = Column(String(255), nullable=False)
+    property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), nullable=True)
+    listing_url = Column(String(2048), nullable=False)
+    price = Column(Integer, nullable=True)
+    listing_status = Column(String(80), nullable=True)
+    dom = Column(Integer, nullable=True)
+    listed_at = Column(DateTime(timezone=False), nullable=True)
+    absence_count = Column(Integer, nullable=False, default=0)
+    is_delisted = Column(Boolean, nullable=False, default=False)
+    last_seen_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
+    updated_at = Column(DateTime(timezone=False), nullable=False, default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("market_slug", "redfin_id", name="uq_listing_presence_market_redfin"),
+        Index("idx_listing_presence_market_absence", "market_slug", "absence_count"),
+    )
+
+
+class PendingRefresh(Base):
+    """Durable detail-fetch queue; URLs are operational data and never logged."""
+
+    __tablename__ = "pending_refresh"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    market_slug = Column(String(160), ForeignKey("market_freshness.slug"), nullable=False)
+    source = Column(String(50), nullable=False, default="redfin")
+    redfin_id = Column(String(255), nullable=False)
+    property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), nullable=True)
+    listing_url = Column(String(2048), nullable=False)
+    reason = Column(String(50), nullable=False)
+    status = Column(String(20), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
+    last_error_class = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
+    updated_at = Column(DateTime(timezone=False), nullable=False, default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("market_slug", "redfin_id", name="uq_pending_refresh_market_redfin"),
+        Index("idx_pending_refresh_due", "status", "next_attempt_at"),
+    )
+
+
+class ChangeEvent(Base):
+    """PII-free local event stream produced by search and score diffs."""
+
+    __tablename__ = "change_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), nullable=True)
+    market_slug = Column(String(160), ForeignKey("market_freshness.slug"), nullable=False)
+    redfin_id = Column(String(255), nullable=False)
+    kind = Column(String(30), nullable=False)
+    detail = Column(JSONB, nullable=False, default=dict)
+    observed_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
+
+    __table_args__ = (
+        Index("idx_change_events_market_observed", "market_slug", "observed_at"),
+        Index("idx_change_events_property", "property_id"),
+    )
+
+
+class AnalysisTier(Base):
+    """Previous published rank state used to detect tier and percentile moves."""
+
+    __tablename__ = "analysis_tiers"
+
+    property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), primary_key=True)
+    lens = Column(String(30), primary_key=True)
+    score = Column(Float, nullable=True)
+    percentile = Column(Float, nullable=True)
+    tier = Column(String(20), nullable=False)
+    computed_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
 
 
 class RawScrape(Base):
@@ -254,6 +355,8 @@ class Property(Base):
 
     listed_at = Column(DateTime(timezone=False), nullable=True)
     last_seen_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
+    refreshed_at = Column(DateTime(timezone=False), nullable=True)
+    delisted_at = Column(DateTime(timezone=False), nullable=True)
     created_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
     updated_at = Column(DateTime(timezone=False), nullable=False, default=utc_now, onupdate=utc_now)
 

@@ -40,6 +40,7 @@ from aevorex.db.models import (
     ScrapeError,
     TaxHistory,
     TransportStop,
+    utc_now,
 )
 from aevorex.normalizers.base import BaseNormalizer
 from aevorex.scrapers.base import BaseScraper
@@ -67,7 +68,12 @@ class PipelineRunner:
         result = await runner.run_scrape(session, state)
     """
 
-    def __init__(self, scraper: BaseScraper, normalizer: BaseNormalizer, max_concurrent_fetches: int = 6):
+    def __init__(
+        self,
+        scraper: BaseScraper,
+        normalizer: BaseNormalizer,
+        max_concurrent_fetches: int | None = None,
+    ):
         """
         Initialize pipeline with scraper and normalizer.
 
@@ -85,7 +91,13 @@ class PipelineRunner:
         """
         self.scraper = scraper
         self.normalizer = normalizer
-        self.max_concurrent_fetches = max_concurrent_fetches
+        from aevorex.config import settings
+
+        self.max_concurrent_fetches = (
+            settings.scraper_concurrent_urls
+            if max_concurrent_fetches is None
+            else max_concurrent_fetches
+        )
 
         # scraper.platform has been observed returning the lowercased class
         # name (e.g. "redfinscraper") instead of the intended source label —
@@ -256,6 +268,8 @@ class PipelineRunner:
 
             property_obj, is_new = await Deduplicator.upsert(session, self.source, normalized)
             property_obj.raw_scrape_id = raw_scrape.id
+            property_obj.refreshed_at = utc_now()
+            property_obj.delisted_at = None
 
             satellites_changed = await self._upsert_satellites(session, property_obj, normalized)
             if satellites_changed:
