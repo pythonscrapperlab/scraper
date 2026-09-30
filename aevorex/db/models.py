@@ -690,6 +690,7 @@ class PropertyAnalysis(Base):
     motivated_seller_rationale = Column(Text, nullable=True)
     motivated_seller_factors = Column(JSON, nullable=True)
     motivated_seller_flags = Column(JSON, nullable=True)  # list of data-quality flag strings
+    motivated_seller_grade = Column(String(1), nullable=True, index=True)
     motivated_seller_breakdown = Column(JSONB, nullable=True)
 
     fix_flip_score = Column(Float, nullable=True, index=True)
@@ -698,6 +699,7 @@ class PropertyAnalysis(Base):
     fix_flip_rationale = Column(Text, nullable=True)
     fix_flip_factors = Column(JSON, nullable=True)
     fix_flip_flags = Column(JSON, nullable=True)
+    fix_flip_grade = Column(String(1), nullable=True, index=True)
     fix_flip_breakdown = Column(JSONB, nullable=True)
 
     buy_hold_score = Column(Float, nullable=True, index=True)
@@ -706,6 +708,7 @@ class PropertyAnalysis(Base):
     buy_hold_rationale = Column(Text, nullable=True)
     buy_hold_factors = Column(JSON, nullable=True)
     buy_hold_flags = Column(JSON, nullable=True)
+    buy_hold_grade = Column(String(1), nullable=True, index=True)
     buy_hold_breakdown = Column(JSONB, nullable=True)
 
     # Mid-term / snowbird letting, 30+ days.
@@ -715,6 +718,7 @@ class PropertyAnalysis(Base):
     str_rationale = Column(Text, nullable=True)
     str_factors = Column(JSON, nullable=True)
     str_flags = Column(JSON, nullable=True)
+    str_grade = Column(String(1), nullable=True, index=True)
     str_breakdown = Column(JSONB, nullable=True)
 
     # Nightly vacation letting, under 30 days.
@@ -724,6 +728,7 @@ class PropertyAnalysis(Base):
     airbnb_rationale = Column(Text, nullable=True)
     airbnb_factors = Column(JSON, nullable=True)
     airbnb_flags = Column(JSON, nullable=True)
+    airbnb_grade = Column(String(1), nullable=True, index=True)
     airbnb_breakdown = Column(JSONB, nullable=True)
 
     # Tags which ScoringConfig.CONFIG_VERSION produced these scores, so a

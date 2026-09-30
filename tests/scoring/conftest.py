@@ -207,13 +207,16 @@ def make_context(
     valuation=USE_DEFAULT,
     market=USE_DEFAULT,
     amenities=None,
+    pois=None,
     **prop_overrides,
 ) -> ScoringContext:
     """
     Build a context. `valuation` and `market` default to healthy fixtures;
-    pass None explicitly to test the missing-data paths.
+    pass None explicitly to test the missing-data paths. `pois` is a list of
+    (name, distance_miles) pairs.
     """
     return ScoringContext(
+        pois=pois or [],
         property=make_property(**prop_overrides),
         price_history=price_history or [],
         tax_history=tax_history or [],

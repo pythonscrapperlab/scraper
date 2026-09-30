@@ -12,7 +12,34 @@ those cases are noted inline. The rest are stated market assumptions.
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
-CONFIG_VERSION = "v2"
+CONFIG_VERSION = "v3"
+
+
+# ---------------------------------------------------------------------------
+# Letter grades
+# ---------------------------------------------------------------------------
+
+# Investors do not trade on five 0-100 numbers. Each strategy also emits a
+# letter grade on these thresholds so a list can be filtered to "A and B
+# deals" and a rationale can open with a verdict. Thresholds are on the
+# final (confidence-adjusted, gated) score, so a speculative 85 that shrinks
+# to a 62 grades as the B it deserves.
+GRADE_THRESHOLDS: Tuple[Tuple[str, float], ...] = (
+    ("A", 80.0),
+    ("B", 65.0),
+    ("C", 50.0),
+    ("D", 35.0),
+    ("F", 0.0),
+)
+
+
+def letter_grade(score) -> "str | None":
+    if score is None:
+        return None
+    for grade, floor in GRADE_THRESHOLDS:
+        if score >= floor:
+            return grade
+    return "F"
 
 
 # ---------------------------------------------------------------------------
@@ -31,11 +58,53 @@ class MotivatedSellerConfig:
     available on every property.
     """
 
-    distress_weight: float = 0.34
-    price_cut_weight: float = 0.26
-    dom_weight: float = 0.18
-    discount_weight: float = 0.14
+    distress_weight: float = 0.30
+    price_cut_weight: float = 0.22
+    dom_weight: float = 0.15
+    discount_weight: float = 0.12
+    # Equity position: a seller who bought long ago with a small loan can
+    # take a discount; one who bought in 2022 at the top cannot, whatever
+    # they say. Derived from the last sold event in price_history, which is
+    # present on 86% of the corpus.
+    equity_weight: float = 0.13
     keyword_weight: float = 0.08
+
+    # --- equity position ---
+    # Assumed loan at purchase, for implied equity when no better data exists.
+    assumed_purchase_ltv: float = 0.80
+    # A sale older than this is treated as fully paid down for scoring.
+    equity_full_after_years: int = 15
+    # Implied equity (as a share of our value) at which the seller can absorb
+    # any realistic discount. Equity is ABILITY to discount, not motivation
+    # — a 20-year owner with a paid-off house is not thereby pressed to sell
+    # — so the ability ramp tops out below the component's full range.
+    equity_pct_for_full_score: float = 0.50
+    equity_ability_max_score: float = 60.0
+    # Asking below what they paid within this window is a loss seller — the
+    # strongest pressure signal short of a lender being involved, and it
+    # takes the whole component regardless of how much equity is left.
+    loss_seller_window_years: int = 5
+    loss_seller_score: float = 100.0
+
+    # --- listing churn ---
+    # Distinct MLS listing numbers on sale-side listed/relisted events within
+    # the window. Two runs is common (a relist), three or more is a seller
+    # cycling agents, which brokers read as ready-to-deal.
+    churn_window_months: int = 36
+    churn_two_runs_bonus: float = 6.0
+    churn_three_runs_bonus: float = 14.0
+
+    # --- confidence floor by coverage ---
+    # A single weak signal (a discount against a market-median value on a
+    # coming-soon listing) used to reach 80/100 on 14% coverage, because the
+    # generic floor keeps 55% of the deviation from 50 regardless. Below this
+    # coverage the floor drops so one input cannot carry a lead to the top.
+    thin_coverage_threshold: float = 0.45
+    thin_coverage_floor: float = 0.10
+
+    # `original_list_price` below this share of the current price is junk (a
+    # lot listing, a typo) and is ignored rather than producing a 99% "cut".
+    min_original_price_ratio: float = 0.25
 
     # --- distress status -> points. Not interchangeable: these differ in how
     # motivated the seller is AND in how executable the deal is.
@@ -155,6 +224,53 @@ class FixFlipConfig:
     # 70% rule, used as a sanity benchmark alongside the full underwrite.
     mao_arv_factor: float = 0.70
 
+    # --- ranking basis ---
+    # The score is now driven primarily by the GAP between asking price and
+    # the maximum allowable offer, which is how a flipper actually triages:
+    # at or under MAO is a deal, within ~10% is a negotiation, 20%+ over is
+    # a pass. Levered ROI stays as a secondary input; on its own it is the
+    # most error-amplifying number in the system, which is why valuation
+    # mistakes owned the top of the previous ranking.
+    gap_weight: float = 0.70
+    roi_weight: float = 0.30
+    # Logistic on (MAO - asking) / asking, in percent. Midpoint at -8% means
+    # asking 8% over MAO scores 50; steepness 7 puts asking at MAO around 75
+    # and asking 20% over MAO around 15.
+    gap_midpoint_pct: float = -8.0
+    gap_steepness: float = 7.0
+
+    # --- seller pressure fusion ---
+    # A property 15% over MAO with a seller who has cut three times and is
+    # in foreclosure is a better lead than one 5% over MAO listed yesterday.
+    # The motivated-seller score scales the flip score within this band.
+    pressure_weight: float = 0.20        # 0 = ignore pressure entirely
+    pressure_neutral_score: float = 35.0  # ms score at which the modifier is 1.0
+
+    # --- winner's-curse gate ---
+    # When our value sits far above asking with no corroboration, the most
+    # likely explanation is that the comps are wrong, not that the listing
+    # agent left 40% on the table. The valuation layer flags and shrinks
+    # these; this caps what is left so they cannot lead the list.
+    uncorroborated_value_cap: float = 55.0
+    # A comp set that looks like the wrong product (detached comps for a
+    # townhouse subject, or the reverse) is the same failure in a milder
+    # form, and after the first rebuild it still owned the top ten.
+    type_mismatch_cap: float = 60.0
+    # Fix & flip is the strategy where valuation error is most amplified, so
+    # its confidence floor is lower than the generic 0.55: a deal built on a
+    # 0.1-confidence valuation should sit near 50, not near 75.
+    confidence_floor: float = 0.30
+
+    # --- exit liquidity ---
+    # ARV $/sqft above this multiple of the market's p75 sold $/sqft means
+    # the renovated house would be the most expensive sale on the block.
+    exit_ceiling_ratio: float = 1.15
+    exit_ceiling_penalty: float = 0.20
+    # Median days on market above this marks a slow market for a six-month
+    # flip clock; the penalty ramps to the maximum at twice the threshold.
+    slow_market_dom_days: float = 60.0
+    slow_market_max_penalty: float = 0.15
+
 
 # ---------------------------------------------------------------------------
 # Buy and hold
@@ -193,6 +309,46 @@ class BuyHoldConfig:
     # Association approval adds weeks and can reject an investor buyer.
     hoa_approval_penalty: float = 4.0
 
+    # --- all-in basis ---
+    # Yield is measured on price PLUS the renovation needed before the
+    # property can be let. Without this a $60,000 uninhabitable house with a
+    # $1,700 modelled rent showed a 24% cap rate and led the list; no tenant
+    # pays rent on a house with no working kitchen.
+    use_all_in_basis: bool = True
+
+    # --- debt service ---
+    # DSCR lenders — the product most small investors actually use for a
+    # rental — want NOI over debt service of 1.20 or better; below 1.0 the
+    # property does not pay its own mortgage. Negative levered cash flow is
+    # capped rather than merely noted: a 9% cap rate on a building nobody
+    # will finance is not a 9% cap rate.
+    min_dscr: float = 1.0
+    negative_cash_flow_cap: float = 55.0
+    closing_cost_pct: float = 0.02
+
+    # --- Florida condo risk ---
+    # Post-Surfside, condos built before 1992 face milestone structural
+    # inspections and fully funded reserves (SIRS), which are arriving as
+    # special assessments and falling prices. The prior scorer sent buyers
+    # straight at this stock. Points accumulate and are applied as a
+    # multiplicative penalty; a financeability killer caps outright.
+    condo_risk_year_built_before: int = 1992
+    condo_risk_age_points: float = 25.0
+    # HOA per sqft this far above the market's own median HOA suggests a
+    # distressed association (deferred maintenance already being billed).
+    condo_hoa_ratio_high: float = 1.6
+    condo_hoa_high_points: float = 20.0
+    condo_special_assessment_points: float = 35.0
+    condo_cash_only_points: float = 30.0
+    # Penalty fraction per 100 risk points, capped.
+    condo_risk_max_penalty: float = 0.40
+    # A condo-hotel or resort unit cannot be let long-term and cannot be
+    # financed conventionally. It is not a buy-and-hold at all.
+    condo_hotel_cap: float = 25.0
+    # An attached property with no HOA fee on record is missing data, not a
+    # free building. Its NOI is overstated, so its score is capped.
+    missing_hoa_cap: float = 45.0
+
 
 # ---------------------------------------------------------------------------
 # Mid-term / snowbird letting (30+ days)
@@ -219,16 +375,48 @@ class MidTermRentalConfig:
     revenue_weight: float = 0.40
     suitability_weight: float = 0.30
 
-    # Mid-term commands a premium over an annual lease but is not nightly
-    # money. 1.35x is a realistic Florida seasonal blend.
-    rent_premium_multiplier: float = 1.35
-    # Snowbird season is roughly November to April; the rest of the year is
-    # softer. 8 months of occupancy at the premium rate is a fair year.
-    occupied_months_per_year: float = 8.0
+    # SEASONAL MODEL. The previous flat 1.35x over 8 months lost to an annual
+    # lease on every one of 9,423 scored properties, so the score degenerated
+    # into "cheapest property wins". A Florida seasonal let is not a flat
+    # premium: in-season (roughly January to April) furnished rents in the
+    # snowbird markets run 1.8-2.5x the annual rate, shoulder months a little
+    # above annual, and summer is soft or empty. Modelled as three blocks.
+    season_months: float = 4.0
+    season_multiplier: float = 1.9
+    shoulder_months: float = 4.0
+    shoulder_multiplier: float = 1.1
+    # Remaining months are assumed vacant (12 - season - shoulder).
+    # Per-market overrides for the in-season multiplier, keyed "city,ST"
+    # lowercased. The Gulf and Treasure Coast snowbird markets command more
+    # than the inland ones; Miami's seasonality is weaker and its annual
+    # rents already high.
+    season_multiplier_by_market: Dict[str, float] = field(default_factory=lambda: {
+        "naples,FL": 2.4, "vero beach,FL": 2.2, "sarasota,FL": 2.2,
+        "jupiter,FL": 2.2, "fort myers,FL": 2.1, "boca raton,FL": 2.0,
+        "cape coral,FL": 2.0, "st. petersburg,FL": 1.9, "clearwater,FL": 1.9,
+        "west palm beach,FL": 1.9, "palm coast,FL": 1.7, "st. augustine,FL": 1.8,
+        "miami,FL": 1.5, "miami beach,FL": 1.7, "orlando,FL": 1.4,
+        "jacksonville,FL": 1.3, "pensacola,FL": 1.6, "tampa,FL": 1.5,
+        "san jose,CA": 1.2,
+    })
     # Higher than long-term (turnover, furnishing, utilities) but far below
     # nightly.
     management_pct: float = 0.15
     furnishing_cost_per_sqft: float = 12.0
+
+    # The revenue score now answers "is mid-term better than an annual lease
+    # HERE" (uplift) as well as "is the yield good" — and where the annual
+    # lease wins, the strategy says so and is capped rather than pretending.
+    uplift_weight: float = 0.55
+    net_yield_weight: float = 0.45
+    uplift_pct_for_full_score: float = 40.0
+    annual_lease_wins_cap: float = 45.0
+
+    # Travelling healthcare staff on 13-week contracts are the other half of
+    # mid-term demand. A hospital (not a veterinary one) inside this radius
+    # is a stronger signal than any walkability dimension.
+    hospital_radius_miles: float = 3.0
+    hospital_bonus: float = 10.0
 
     # Lifestyle dimensions that matter to a 3-month tenant, and their weights.
     location_dimensions: Dict[str, float] = field(default_factory=lambda: {
@@ -290,11 +478,26 @@ class AirbnbConfig:
 
     # --- revenue proxy ---
     # Nightly rate as a multiple of the property's daily long-term rent.
-    # 2.6x is a conservative mid-range for Florida leisure markets.
-    adr_multiple_of_daily_ltr: float = 2.6
-    base_occupancy: float = 0.60
-    peak_location_occupancy: float = 0.75
-    weak_location_occupancy: float = 0.42
+    # Was 2.6x, which on a modelled $14,000/month Brickell 3-bed produced a
+    # $1,197 nightly rate and a 24% net yield — roughly double what those
+    # units actually gross. 2.0x at lower occupancy is still generous but
+    # no longer fantasy.
+    adr_multiple_of_daily_ltr: float = 2.0
+    base_occupancy: float = 0.55
+    peak_location_occupancy: float = 0.65
+    weak_location_occupancy: float = 0.40
+
+    # Condo buildings overwhelmingly prohibit or restrict nightly letting in
+    # their own rules regardless of what the city allows, and nothing in a
+    # listing says otherwise unless it advertises it. Capped, not zeroed.
+    condo_default_cap: float = 60.0
+
+    # Leisure demand drivers the walkability dimensions cannot see, taken
+    # from the points-of-interest table by name.
+    beach_radius_miles: float = 1.5
+    beach_bonus: float = 14.0
+    theme_park_radius_miles: float = 8.0
+    theme_park_bonus: float = 12.0
     # Nightly management, cleaning and platform fees. Far above long-term.
     management_pct: float = 0.28
     furnishing_cost_per_sqft: float = 18.0

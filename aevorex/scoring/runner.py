@@ -18,6 +18,7 @@ philosophy: one bad property should not lose a run's completed work.
 """
 
 import logging
+import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
@@ -28,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aevorex.db.models import (
     LocationScore,
     MarketSnapshot,
+    PointOfInterest,
     PriceHistory,
     Property,
     PropertyAnalysis,
@@ -39,7 +41,7 @@ from aevorex.db.models import (
 from aevorex.market.stats import classify_property, resolve_market
 from aevorex.normalizers.amenities import parse_amenities
 from aevorex.scoring.airbnb import AirbnbScorer
-from aevorex.scoring.base import BaseScorer, ScoringContext
+from aevorex.scoring.base import BaseScorer, ScoringContext, tier_for_percentile
 from aevorex.scoring.buy_hold import BuyAndHoldScorer
 from aevorex.scoring.config import DEFAULT_CONFIG, ScoringConfig
 from aevorex.scoring.curves import assign_percentiles
@@ -62,6 +64,9 @@ class ScoringRunner:
         stats = await runner.run(session)
     """
 
+    # ORDER MATTERS. motivated_seller runs first because fix_flip reads its
+    # result (seller pressure scales the deal score). Each scorer receives the
+    # results of those before it via ScoringContext.prior_results.
     SCORERS: List[BaseScorer] = [
         MotivatedSellerScorer(),
         FixAndFlipScorer(),
@@ -131,7 +136,11 @@ class ScoringRunner:
     async def _score_one(self, session: AsyncSession, prop: Property) -> bool:
         """Score one property. Returns whether a valuation backed the scores."""
         ctx = await self._build_context(session, prop)
-        results = {scorer.STRATEGY_KEY: scorer.score(ctx) for scorer in self.SCORERS}
+        results = {}
+        for scorer in self.SCORERS:
+            result = scorer.score(ctx)
+            results[scorer.STRATEGY_KEY] = result
+            ctx.prior_results[scorer.STRATEGY_KEY] = result
         await self._upsert_analysis(session, prop.id, results)
         prop.needs_analysis = False
         await session.commit()
@@ -158,6 +167,13 @@ class ScoringRunner:
         features = await session.get(PropertyFeature, prop.id)
         valuation = await session.get(PropertyValuation, prop.id)
 
+        # Name + distance only: the category column is never populated by the
+        # source, so consumers match on name (hospitals, beaches, theme parks).
+        pois = (await session.execute(
+            select(PointOfInterest.name, PointOfInterest.distance_miles)
+            .where(PointOfInterest.property_id == prop.id)
+        )).all()
+
         market_snapshot = None
         if prop.zip_code:
             market_snapshot = (await session.execute(
@@ -178,6 +194,7 @@ class ScoringRunner:
             market=await self._market_for(session, prop),
             amenities=parse_amenities(features.raw_amenities if features else None),
             config=self.config,
+            pois=[(name, distance) for name, distance in pois],
         )
 
     async def _market_for(self, session: AsyncSession, prop: Property) -> Optional[dict]:
@@ -207,6 +224,8 @@ class ScoringRunner:
             setattr(analysis, f"{strategy_key}_factors", result.factors)
             setattr(analysis, f"{strategy_key}_flags", result.data_quality_flags)
             setattr(analysis, f"{strategy_key}_confidence", result.confidence)
+            setattr(analysis, f"{strategy_key}_grade", result.grade)
+            setattr(analysis, f"{strategy_key}_breakdown", result.breakdown)
         await session.flush()
 
     # ------------------------------------------------------------------
@@ -230,13 +249,33 @@ class ScoringRunner:
                    else ("__state__", state))
             pools[key].append(analysis)
 
-        for pool in pools.values():
+        for pool_key, pool in pools.items():
             for scorer in self.SCORERS:
                 strategy = scorer.STRATEGY_KEY
                 scores = [getattr(a, f"{strategy}_score") for a in pool]
-                for analysis, percentile in zip(pool, assign_percentiles(scores)):
+                percentiles = assign_percentiles(scores)
+                pool_n = sum(score is not None for score in scores)
+                level = "state" if pool_key[0] == "__state__" else "city"
+                key = (str(pool_key[1]).lower() if level == "state"
+                       else _market_slug(str(pool_key[0]), str(pool_key[1])))
+                for analysis, percentile in zip(pool, percentiles):
                     setattr(analysis, f"{strategy}_percentile", percentile)
+                    breakdown = dict(getattr(analysis, f"{strategy}_breakdown") or {})
+                    if breakdown:
+                        breakdown.update({
+                            "score": getattr(analysis, f"{strategy}_score"),
+                            "grade": getattr(analysis, f"{strategy}_grade"),
+                            "percentile": percentile,
+                            "confidence": getattr(analysis, f"{strategy}_confidence"),
+                            "tier": tier_for_percentile(percentile),
+                            "pool": {"level": level, "key": key, "n": pool_n},
+                        })
+                        setattr(analysis, f"{strategy}_breakdown", breakdown)
 
         await session.commit()
         logger.info("Assigned percentiles across %d ranking pools.", len(pools))
         return len(rows)
+
+
+def _market_slug(city: str, state: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", f"{city}-{state}".lower()).strip("-")
