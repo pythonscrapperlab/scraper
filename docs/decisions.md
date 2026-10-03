@@ -339,3 +339,23 @@ Audit 2026-10-03 found correctness bugs and a publisher that sent far more than 
 - **`.claude/settings.local.json`**: untracked and never committed, but ignored only by this machine's *global* git ignore, not by the repo. Added to the repo `.gitignore`. It **does contain a live secret**: one allow-rule embeds the local PostgreSQL password (`PGPASSWORD=...`), equal to the current `DB_PASSWORD`. Not edited (it is your permission file).
 - **Rotate**: (1) the local PostgreSQL `DB_PASSWORD` - it is short, sits in plain text in both files, and appeared in this session's tool output; follow the runbook's local-password rotation; (2) the Supabase database password (it is inside `SUPABASE_DIRECT_CONNECTION_URL` in the `old.env` copy), then update `.env`; (3) the Webshare proxy password (`PROXY_PASSWORD`, and `PROXY_USER` if Webshare lets you), in the `old.env` copy. Nothing to rotate for the publishable key (public by design) or the project URL. `SUPABASE_SERVICE_ROLE_KEY` is not configured anywhere on this machine. None of these were found in git history or in any tracked file.
 - Migration ordering note: `20261004091000` was applied before `20261004090000` (serving v3). The Supabase CLI will want `db push --include-all` the first time it sees that history; `scripts/apply_supabase_migration.py` (used here because the CLI is not installed) records history rows itself.
+
+### Step 8 - reclaim and measure (2026-10-04, live)
+
+Sequence: applied `20261004090000` (v3 + alert FK) and `20261004091000` (security) with `scripts/apply_supabase_migration.py`; `publisher rebuild --all` (11 min for five markets); `scripts/vacuum_serving.py` (VACUUM FULL ANALYZE on all 17 serving tables; the longest lock was `scores`, 9.9 s, the rest under 1.5 s). The scheduler could not be stopped without UAC; it stayed on old code, so its pushes would have failed the v3 check until the elevated restart at 01:04 local, which succeeded.
+
+| | before | after rebuild, before VACUUM | after VACUUM FULL |
+|---|---:|---:|---:|
+| `pg_database_size` | 189.77 MiB | 164.75 MiB | **119.82 MiB** |
+| published properties | 6,065 | 6,065 | 6,065 |
+| serving KB / property | 29.97 | 25.69 | **18.11** |
+
+Per table, before -> after (total KiB; live / dead tuples): scores 80,784 -> 57,840 (20,880 / 0); properties 18,192 -> 12,152; images 14,568 -> 10,696; neighbourhood 8,808 -> 7,104; history 18,232 -> 6,024 (72,426 -> 32,493 rows); comps 7,312 -> 5,504; features 18,440 -> 3,696; tax_history 9,744 -> 2,632 (77,384 -> 27,950 rows); valuation 3,184 -> 2,344; agents 1,176 -> 912; change_events 912 -> 648; the rest under 100. Dead tuples before: features 1,226, tax_history 15,183, scores/properties thousands; after: 0 everywhere. Full JSON in `logs/e6/before.json`, `after-rebuild-prevacuum.json`, `after.json`.
+
+**Targets not met.** 18.1 KB/property vs 12 KB. The published set is 6,065 of the ~10,400 locally listed properties (the rest have no detail fetch yet), so the five cities will add roughly 70%: ~205 MiB at today's density vs the 150 MiB target. See the size reality check under step 5 for the levers (breakdown de-duplication -3.2 KB, `rest`-tier breakdowns -9 KB, 6 images -0.8 KB). Scores alone are 9.5 KB/property. Owner decision needed.
+
+### Step 9 - restart and soak
+
+Service restarted at 2026-10-04 01:04 local on the E6 code. Task `aevoraex-e6-soak` runs `scripts/e6_soak.py` every 6 hours for 30 hours (appends to `logs/e6/soak.jsonl`: cloud size, pushes, zero-change pushes, rows written per push, snapshot-guard rejections, valuation versions). **The 24-hour result does not exist yet.** First sample 2026-10-04 01:06 local: 119.58 MiB, 6,065 properties, valuation versions v1 = 1,397, v2 = 9,926, 0 guard rejections.
+
+**Upstream problem found:** since ~2026-10-03 15:30Z every Redfin check fails (`SearchFetchError`, detail fetches `ProxyError`); all five markets are `late`/`failed`. Looks like the Webshare proxy (bandwidth or credentials), not E6 code. Until checks succeed there are no pushes to measure, and the 24 h soak will show zero pushes.
