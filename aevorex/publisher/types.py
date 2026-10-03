@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Literal
 
 # Serving schema version this publisher writes; checked against serving.schema_version.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# Delisted properties stay in the cache this long (audit 2026-10-03; was 30 days).
+DELISTED_RETENTION_DAYS = 7
+
+
+def retention_cutoff(now: datetime) -> datetime:
+    """Naive-UTC cutoff: delisted rows at or after it are kept, strictly older ones pruned.
+
+    The single source of truth for retention; the loader's SQL filter uses it directly.
+    """
+    return now.replace(tzinfo=None) - timedelta(days=DELISTED_RETENTION_DAYS)
+
 
 SizeAction = Literal["ok", "warn", "stop_new_cities", "page"]
 

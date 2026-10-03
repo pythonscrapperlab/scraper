@@ -38,9 +38,25 @@ from aevorex.publisher.diff import (
     scores_hash,
 )
 from aevorex.publisher.markets import market_definition
+from aevorex.publisher.redact import serving_text
 from aevorex.publisher.remote import EXPECTED_COLUMNS, RemoteStore, publisher_engine
+from aevorex.publisher.slim import (
+    FEATURE_COLUMNS,
+    MAX_DESCRIPTION_CHARS,
+    curated_features,
+    latest_comps,
+    recent_history,
+    recent_tax_years,
+    slim_breakdown,
+)
 from aevorex.publisher.snapshots import build_demo_snapshot
-from aevorex.publisher.types import SCHEMA_VERSION, MarketDefinition, PublishResult, classify_size
+from aevorex.publisher.types import (
+    SCHEMA_VERSION,
+    MarketDefinition,
+    PublishResult,
+    classify_size,
+    retention_cutoff,
+)
 from aevorex.scoring.recompose import recompose
 
 LOGGER = logging.getLogger(__name__)
@@ -57,6 +73,13 @@ CHILD_TABLES: dict[str, tuple[str, ...]] = {
     "neighbourhood": ("property_id",),
     "tax_history": ("property_id", "tax_year"),
 }
+FLAG_KEYS = (
+    "is_foreclosure", "is_reo", "is_short_sale", "is_auction", "is_probate_or_estate", "is_as_is",
+    "is_vacant", "is_tenant_occupied", "is_cash_only", "is_age_restricted",
+    "is_rental_restricted", "allows_str",
+)
+# Driver ``field`` names kept in scores.breakdown: those the web already holds for the property.
+BREAKDOWN_FIELDS = frozenset(EXPECTED_COLUMNS["properties"] | EXPECTED_COLUMNS["valuation"] | set(FLAG_KEYS))
 EVENT_BACKFILL_DAYS = 14  # first push of a market: recent events only, not the full history
 EVENT_OVERLAP_MINUTES = 10  # re-read window; ON CONFLICT DO NOTHING makes repeats free
 
@@ -75,17 +98,6 @@ def _json(value: Any, fallback: Any) -> Any:
 
 def _market_id(slug: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"https://aevoraex.com/markets/{slug}")
-
-
-def retained_delisted(delisted_at: datetime | None, now: datetime) -> bool:
-    """Retain through the exact 30-day boundary; prune only strictly older rows."""
-    if delisted_at is None:
-        return True
-    comparable_now = now.replace(tzinfo=None) if now.tzinfo is not None else now
-    comparable_delisted = (
-        delisted_at.replace(tzinfo=None) if delisted_at.tzinfo is not None else delisted_at
-    )
-    return comparable_delisted >= comparable_now - timedelta(days=30)
 
 
 def apply_rejections(result: PublishResult, property_ids: Sequence[str]) -> None:
@@ -499,7 +511,7 @@ class Publisher:
     async def _load_local(
         self, definition: MarketDefinition
     ) -> tuple[list[Property], MarketFreshness]:
-        cutoff = self.now.replace(tzinfo=None) - timedelta(days=30)
+        cutoff = retention_cutoff(self.now)
         async with self.local_sessions() as session:
             freshness = await session.get(MarketFreshness, definition.slug)
             if freshness is None:
@@ -607,8 +619,8 @@ class Publisher:
                 "transit": item.transit_score,
                 "bike": item.bike_score,
             },
-            "description": item.description[:1500] if item.description else None,
-            "ai_summary": item.ai_summary,
+            "description": serving_text(cast("str | None", item.description), MAX_DESCRIPTION_CHARS),
+            "ai_summary": serving_text(cast("str | None", item.ai_summary), None),
             "photo_count": len(item.property_images),
             "updated_at": _aware(item.updated_at),
         }
@@ -648,7 +660,7 @@ class Publisher:
                     "prev_percentile": None,
                     "rationale": getattr(analysis, f"{lens}_rationale"),
                     "flags": _json(getattr(analysis, f"{lens}_flags"), []),
-                    "breakdown": breakdown,
+                    "breakdown": slim_breakdown(breakdown, BREAKDOWN_FIELDS),
                     "version": analysis.scoring_config_version or "v3",
                     "computed_at": _aware(analysis.computed_at),
                 })
@@ -727,13 +739,13 @@ class Publisher:
             rows["images"].append(
                 {"property_id": item.id, "sort_order": order, "url": image.url}
             )
-        for comp in item.comps:
+        for comp in latest_comps(item.comps):
             rows["comps"].append({
                 "id": comp.id, "property_id": item.id, "address": comp.comp_address,
                 "price": comp.price, "beds": comp.bedrooms, "baths": comp.bathrooms,
                 "sqft": comp.sqft, "sold_date": comp.sold_date.date() if comp.sold_date else None,
             })
-        for event in item.price_history:
+        for event in recent_history(item.price_history, self.now):
             rows["history"].append({
                 "id": event.id, "property_id": item.id, "event_type": event.event_type,
                 "event": event.event, "price": event.price, "event_date": _aware(event.event_date),
@@ -741,16 +753,12 @@ class Publisher:
             })
         features: PropertyFeature | None = item.features
         if features is not None:
-            flattened = dict(_json(features.raw_amenities, {}))
-            for key in (
-                "heating", "cooling", "flooring", "construction_material", "roof",
-                "foundation", "interior_features", "appliances", "laundry_features",
-                "water_source", "sewer", "utilities", "furnished", "direction_faces",
-            ):
-                value = getattr(features, key)
-                if value is not None:
-                    flattened[key] = value
-            rows["features"].append({"property_id": item.id, "features": flattened})
+            curated = curated_features(
+                {name: getattr(features, name) for name in FEATURE_COLUMNS},
+                _json(features.raw_amenities, {}),
+            )
+            if curated:
+                rows["features"].append({"property_id": item.id, "features": curated})
         schools = [
             {
                 "name": school.name, "type": school.school_type, "grades": school.grades,
@@ -775,8 +783,7 @@ class Publisher:
             "location_scores": location_scores,
             "transport_count": len(item.transport_stops),
         })
-        taxes_by_year = {tax.tax_year: tax for tax in item.tax_history}
-        for tax in taxes_by_year.values():
+        for tax in recent_tax_years(item.tax_history):
             rows["tax_history"].append({
                 "property_id": item.id, "tax_year": tax.tax_year,
                 "tax_amount": tax.tax_amount, "assessed_value": tax.assessed_value,

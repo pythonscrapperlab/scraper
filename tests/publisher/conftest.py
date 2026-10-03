@@ -147,8 +147,11 @@ async def reset(rig: Rig) -> None:
         )
         await session.execute(delete(ChangeEvent).where(ChangeEvent.market_slug == SLUG))
         await session.execute(delete(ListingPresence).where(ListingPresence.market_slug == SLUG))
-        await session.execute(text("delete from property_analysis where property_id in "
-                                   "(select id from properties where redfin_id like 'e6-%')"))
+        for table in ("property_analysis", "price_history", "property_comps", "property_images",
+                      "tax_history", "property_features"):
+            await session.execute(text(
+                f"delete from {table} where property_id in "
+                "(select id from properties where redfin_id like 'e6-%')"))
         await session.execute(delete(Property).where(Property.redfin_id.like("e6-%")))
         await session.execute(delete(MarketFreshness).where(MarketFreshness.slug == SLUG))
         await session.execute(text("delete from serving.markets where slug = :slug"), {"slug": SLUG})
