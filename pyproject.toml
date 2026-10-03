@@ -32,6 +32,7 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = [
   "aevorex.run_tracking",
+  "aevorex.alerts.*",
   "aevorex.freshness.*",
   "aevorex.publisher.*",
   "aevorex.scheduler.*",

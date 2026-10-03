@@ -129,3 +129,41 @@ Status: implemented, installed and running; the 48-hour soak is **in progress** 
 - Final verification: `ruff check .` passed; Mypy clean (strict on `aevorex.scheduler`);
   Pytest all passing, including DST, stagger, late detector, backoff, lock, discovery, batching and
   publisher-helper tests.
+
+## 2026-10-03 — E5 alerts, brief, RLS proof, views, soak
+
+Status: implemented and verified; the seven-day soak is **in progress** (Day 0 recorded below).
+
+- Branch `feat/e5-alerts-soak` from the merged E4 baseline. No scoring, valuation, weight, gate or
+  normalizer file was touched; alerts only read percentiles and tiers that already exist.
+- Alerts (`aevorex/alerts/`): pure crossing and quiet-hours rules; publisher step 6 compares the
+  cache's pre-push (percentile, tier) with the new score, honours the org threshold (`min_percentile`
+  or `tier`), channel and quiet hours, is idempotent, and commits with the scores. Morning brief:
+  a 10-minute scheduler sweep queues one brief per member per org-market per org-local day
+  (07:00-11:00 window; 5/10/15/25 properties by plan).
+- RLS proof (`tests/rls`): anon sees only demo snapshots and the 12 public market columns; Starter
+  cannot read agents; users cannot read other orgs' markets; only the service role writes; a user
+  in both a Starter and a Pro org gets agents only where the Pro org subscribes. **It found a
+  real defect**: signed-in users could not read `properties`, `scores` etc. because the E0 policies
+  join `serving.markets` columns `authenticated` had no grant on. Fixed (`20261003115500`).
+  Deployed policies re-proven live (rolled-back fixtures). The Auth admin-API variant is written
+  but **not run**: no `SUPABASE_SERVICE_ROLE_KEY` is configured.
+- Views: `serving.v_shortlist`, `v_property`, `v_agent`, `v_market_public` (security invoker).
+  EXPLAIN ANALYZE on Orlando (1,196 listings): shortlist 1,363 ms -> 28 ms after rewriting the RLS
+  policies as uncorrelated subqueries and adding `change_events(property_id, observed_at desc)`.
+  Documented in `docs/schema.md`. All four E5 migrations are applied to the linked project.
+- Live checks: an alert crossing enqueued exactly once and a repeat enqueued nothing on the real
+  project (rolled back); the brief sweep ran against live data with no orgs enqueued.
+- `docs/handover-web.md` written. The per-`DataApi`-method table is **empty** until the interface is
+  pasted; the by-need map is complete.
+- Soak collector `scheduler soak-daily` and task `aevoraex-soak-daily-e5-7d` (daily 23:55, registered
+  without elevation, so it runs only while the user is logged on).
+- Verification: see the E5 handoff report.
+
+## E5 seven-day soak
+
+Soak `e5-7d` started 2026-10-03 10:20Z. One row per day from `main.py scheduler soak-daily`; a day with no row means the collector did not run - nothing is back-filled.
+
+| day (local) | window UTC | checks ok/failed | refreshes ok/failed | refresh p50 / max min | block rate | late events | alerts / briefs queued | local DB MiB | cloud DB MiB |
+|---|---|---|---|---:|---:|---:|---|---:|---:|
+| 2026-10-03 | 10-02 10:20Z → 10-03 10:20Z | 6/0 | 0/4 | 2.9 / 5.4 | n/a | 0 | 0 / 0 | 1172.5 | 88.1 |

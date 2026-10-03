@@ -225,3 +225,53 @@
   This is recorded, not hidden: the founder decides between more concurrency (AGENTS.md allows
   4, watch the 405/block rate), fewer cities, or refreshing only listings that changed.
 
+## E5 - alerts, brief, RLS proof, views, soak
+
+- **Alerts compare against the cache, not `prev_percentile`.** AGENTS.md 8.6 words the rule as
+  "moved into the tier since `prev_percentile`". `prev_percentile` only moves when the percentile
+  changes, so a crossing from days ago would still look like one on every later push. Instead the
+  publisher reads the cache's (percentile, tier) per property and lens *before* the score upsert and
+  alerts only when a score qualifies now and did not then. Unchanged pushes alert nothing; a
+  `dedupe_key` unique index is a second line of defence.
+- **Alerts commit with the scores.** If the alert write fails the score upsert rolls back too, so
+  the crossing is seen again on the retry. A failed push is visible (publish debt) and a lost alert
+  is not.
+- **A market's first push is a silent baseline.** With no earlier cache state everything is a
+  "crossing"; a rebuild would otherwise mail every qualifying listing. Counted as
+  `alert_baseline_suppressed`.
+- **Thresholds: percentile wins over tier.** `app.thresholds` keeps one row per org per lens;
+  `min_percentile` (inclusive) overrides `tier` when both are set. The alert's recorded tier may be
+  `rest` for a percentile rule, so the `app.alert_events.tier` check was widened.
+- **Quiet hours only defer e-mail.** In-app alert rows are written immediately; the queue row gets
+  `send_after` = the next quiet-end in the org's timezone. Default window 21:00-07:00 org-local,
+  per user, disable-able. Nonexistent DST-gap times map forward; fall-back is unambiguous because
+  only the end instant is computed.
+- **Morning brief is a sweep, not 07:00 cron jobs per org.** Orgs have different timezones and the
+  laptop sleeps. A 10-minute sweep queues any brief that is due (07:00-11:00 org-local) and not yet
+  queued, keyed by (market, local date, user). It catches up after sleep, is DST-safe by
+  construction, and skips (and counts) a brief that would land after 11:00 rather than send stale
+  news. Brief size by plan: 5, 10, 15, 25 (config). One e-mail per member per org-market; there is
+  no in-app brief because `app.alert_events` is per lens and tier.
+- **`app.orgs` gained `tz` and `default_lens`.** The stub had neither, and "org-local" and "the org's
+  default lens" are both in the spec. Defaults are New York and `motivated_seller`; the web should
+  set `tz` at onboarding.
+- **RLS proof found a real defect.** See `docs/schema.md`: `authenticated` could not evaluate the
+  E0 policies because they join columns of `serving.markets` it had no grant on. Fixed with a
+  column grant, not a SECURITY DEFINER function, so no policy runs with elevated rights.
+- **RLS rewritten for speed, not meaning.** Correlated per-row `EXISTS` policies made a 1,196-row
+  shortlist cost 1.4 s; uncorrelated `IN` subqueries bring it to 28 ms. The proof suite covers both.
+  Plan gating for `agents` is per subscribed market: a user in a Starter org and a Pro org sees agents
+  only in the markets the Pro org subscribes to.
+- **Views are `security_invoker`.** A definer view would bypass RLS and make the Starter/Pro rule
+  depend on the view's owner. `v_shortlist` is wide (five lenses per row) because the web asks for
+  "property + five scores"; at this size the lateral pivot costs milliseconds.
+- **Live RLS proof needs no admin key to run, and uses it when present.** The default suite
+  switches roles inside rolled-back transactions on local Postgres. `AEVORAEX_LIVE_TESTS=1` repeats
+  it against the project through the direct connection (also rolled back). The Auth admin-API variant
+  (confirmed users, no e-mail, deleted afterwards) is implemented but **not yet run**: no
+  `SUPABASE_SERVICE_ROLE_KEY` is configured in `.env`.
+- **The soak is a collector, not a claim.** A seven-day soak cannot be completed in one working
+  session. `scheduler soak-daily` appends one row per day to `docs/progress.md`, replaces a day's
+  row if re-run, and never back-fills a day it did not observe. The first row's trailing 24 h
+  includes the E4 service restarts of 2026-10-03.
+

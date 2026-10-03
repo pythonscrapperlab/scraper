@@ -14,6 +14,8 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from aevorex.alerts.alerts import Candidate, enqueue_threshold_alerts, market_score_states
+from aevorex.alerts.rules import ScoreState
 from aevorex.config import settings
 from aevorex.db.models import (
     ChangeEvent,
@@ -148,6 +150,9 @@ class Publisher:
                 for property_id in rejected:
                     LOGGER.warning("Publisher rejected score breakdown: property_id=%s", property_id)
             async with self.store.transaction() as remote:
+                # Alerts commit atomically with the scores they were derived from: a failed
+                # alert write rolls the scores back too, so the crossing is retried, never lost.
+                previous_states = await market_score_states(remote, market_id)
                 result.counts["scores"] = await self.store.upsert(
                     remote,
                     "scores",
@@ -155,6 +160,14 @@ class Publisher:
                     conflict=("property_id", "lens"),
                     preserve_previous_scores=True,
                 )
+                alert_counts = await enqueue_threshold_alerts(
+                    remote,
+                    definition.slug,
+                    self._alert_candidates(properties, score_rows, previous_states),
+                    self.now,
+                    baseline=not previous_states,
+                )
+                result.counts.update(alert_counts.as_counts())
                 result.counts["scores_pruned"] = await self.store.delete_market_scores_not_in(
                     remote,
                     market_id,
@@ -560,6 +573,38 @@ class Publisher:
                     "computed_at": _aware(analysis.computed_at),
                 })
         return rows, sorted(set(rejected))
+
+    def _alert_candidates(
+        self,
+        properties: Sequence[Property],
+        score_rows: Sequence[dict[str, Any]],
+        previous: dict[tuple[str, str], ScoreState],
+    ) -> list[Candidate]:
+        """Scored rows of still-listed properties, paired with their pre-push cache state."""
+        listed = {
+            str(item.id): item
+            for item in properties
+            if item.delisted_at is None and item.listing_status_normalized in ACTIVE_STATUSES
+        }
+        candidates: list[Candidate] = []
+        for row in score_rows:
+            item = listed.get(str(row["property_id"]))
+            if item is None:
+                continue
+            key = (str(row["property_id"]), str(row["lens"]))
+            computed_at = row["computed_at"] or self.now
+            candidates.append(Candidate(
+                property_id=key[0],
+                lens=key[1],
+                new=ScoreState(float(row["percentile"]), str(row["tier"])),
+                old=previous.get(key),
+                score=float(row["score"]),
+                grade=str(row["grade"]),
+                computed_at=computed_at,
+                address=str(item.address),
+                price=cast(int | None, item.price),
+            ))
+        return candidates
 
     def _child_rows(self, properties: Sequence[Property]) -> dict[str, list[dict[str, Any]]]:
         rows: dict[str, list[dict[str, Any]]] = {

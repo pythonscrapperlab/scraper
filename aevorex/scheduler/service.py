@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import FrameType
 from typing import Any
@@ -16,6 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
+from aevorex.alerts.brief import BriefSweep, run_brief_sweep
 from aevorex.config import settings
 from aevorex.scheduler import locks
 from aevorex.scheduler.cities import ActiveCity, OrgMarketReader, discover
@@ -33,6 +35,7 @@ from aevorex.scheduler.ops import EngineOperations, sweep_orphaned_runs
 from aevorex.scheduler.slots import CHECK, REFRESH, SlotTrigger, previous_slot
 
 LOGGER = logging.getLogger("aevorex.scheduler")
+BriefSweeper = Callable[[datetime, Mapping[str, int]], Awaitable[BriefSweep]]
 SHUTDOWN_GRACE_SECONDS = 10
 
 
@@ -47,12 +50,14 @@ class SchedulerService:
         *,
         clock: Any = utcnow,
         paused: bool = False,
+        brief_sweeper: BriefSweeper | None = None,
     ) -> None:
         self.config = config
         self.ops = ops
         self.org_reader = org_reader
         self.clock = clock
         self.paused = paused
+        self.brief_sweeper = brief_sweeper
         self.cities: dict[str, ActiveCity] = {}
         self.org_slugs: set[str] = set()
         self.unsupported: dict[str, tuple[str, ...]] = {}
@@ -144,6 +149,12 @@ class SchedulerService:
             self.scheduler.add_job(
                 func, "interval", minutes=minutes, id=job_id, replace_existing=True,
                 next_run_time=self.clock() + timedelta(seconds=15),
+            )
+        if self.brief_sweeper is not None:
+            self.scheduler.add_job(
+                self._brief_sweep, "interval", minutes=service.brief_sweep_minutes,
+                id="brief-sweep", replace_existing=True,
+                next_run_time=self.clock() + timedelta(seconds=45),
             )
         finalize = service.nightly_finalize
         self.scheduler.add_job(
@@ -257,6 +268,19 @@ class SchedulerService:
             LOGGER.info("Publish debt retried: flushed=%s remaining=%s",
                         flushed, len(self.runner.publish_debt))
 
+    async def _brief_sweep(self) -> None:
+        """Queue every morning brief that is due (07:00-11:00 org-local); idempotent."""
+        if self.brief_sweeper is None or self.paused:
+            return
+        try:
+            sweep = await self.brief_sweeper(self.clock(), self.config.service.brief_counts)
+        except Exception as exc:
+            LOGGER.warning("Brief sweep failed: error_class=%s", type(exc).__name__)
+            report_warning("brief_sweep_failed")
+            return
+        if sweep.enqueued or sweep.failed or sweep.too_late:
+            LOGGER.info("Brief sweep: %s", json.dumps(sweep.as_counts(), sort_keys=True))
+
     async def _clock_check(self) -> None:
         service = self.config.service
         self.drift = await check_clock(service.clock_warn_seconds, service.clock_fail_seconds)
@@ -348,13 +372,20 @@ async def run_service() -> dict[str, int]:
     from aevorex.scheduler.cities import remote_org_market_reader
 
     reader: OrgMarketReader | None = None
+    sweeper: BriefSweeper | None = None
     if settings.supabase_direct_connection_url is not None:
-        reader = remote_org_market_reader(publisher_engine())
+        remote = publisher_engine()
+        reader = remote_org_market_reader(remote)
+
+        async def sweeper(now: datetime, counts: Mapping[str, int]) -> BriefSweep:
+            return await run_brief_sweep(remote, now, counts_by_plan=counts)
+
     else:
         LOGGER.warning("SUPABASE_DIRECT_CONNECTION_URL unset: demo markets only, nothing publishes")
 
     service = SchedulerService(
-        config, EngineOperations(), reader, paused=settings.scheduler_paused
+        config, EngineOperations(), reader, paused=settings.scheduler_paused,
+        brief_sweeper=sweeper,
     )
     stop = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop)
