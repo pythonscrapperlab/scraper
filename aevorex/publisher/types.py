@@ -32,9 +32,19 @@ class SizeGuard:
     size_mb: float
     action: SizeAction
 
+    @property
+    def allow_children(self) -> bool:
+        """Below 420 MiB everything is written; at or above it, never any child rows."""
+        return self.action in {"ok", "warn"}
+
+    @property
+    def allow_scores(self) -> bool:
+        """Properties and scores are written below 450 MiB; at or above it, freshness only."""
+        return self.action != "page"
+
 
 def classify_size(size_bytes: int) -> SizeGuard:
-    """Classify a database size at the exact 350/420/450 MB boundaries."""
+    """Classify a database size at the exact 350/420/450 MiB boundaries."""
     size_mb = size_bytes / (1024 * 1024)
     if size_mb >= 450:
         action: SizeAction = "page"

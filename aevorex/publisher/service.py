@@ -181,16 +181,27 @@ class Publisher:
                 if guard.action in {"stop_new_cities", "page"} and not exists:
                     raise RuntimeError("SupabaseSizeGuardNewMarket")
                 remote_ids = await self.store.property_ids(remote, market_id)
-                if not exists or market_state.get("market_hash") != market_digest:
+                write_market = guard.allow_scores and (
+                    not exists or market_state.get("market_hash") != market_digest
+                )
+                if write_market:
                     result.rows_written += await self.store.upsert(
                         remote, "markets", [market_row], conflict=("slug",)
                     )
-            await self._save_market_state(definition.slug, market_hash=market_digest)
+            if write_market:
+                await self._save_market_state(definition.slug, market_hash=market_digest)
 
             plan = plan_changes(current=current, known=known, remote_ids=remote_ids)
             result.counts["unchanged_properties"] = plan.unchanged
 
             # ---- properties: changed rows only; departures are always removed ----
+            # Size guard (E6 step 6): >= 450 MiB freshness only, >= 420 MiB no child rows.
+            # Departures are always removed: deleting is how the cache gets smaller.
+            if not guard.allow_scores:
+                plan.properties.clear()
+                plan.scores.clear()
+                result.status = "partial"
+                result.counts["publish_withheld"] = 1
             changed_rows = [property_rows[pid] for pid in sorted(plan.properties, key=str)]
             departed = sorted(plan.departed, key=str)
             async with self.store.transaction() as remote:
@@ -245,6 +256,15 @@ class Publisher:
                 )
 
             # ---- children: replace for changed properties only ----
+            if guard.allow_children:  # re-read: the groups above may have grown the database
+                async with self.store.transaction() as remote:
+                    guard = classify_size(await self.store.database_size(remote))
+            if not guard.allow_children:
+                plan.children.clear()
+                result.size_action = guard.action
+                if guard.allow_scores:
+                    result.status = "partial"  # published scores without children
+                    result.counts["children_withheld"] = 1
             child_ids = sorted(plan.children, key=str)
             for name in CHILD_TABLES:
                 result.counts[name] = 0
@@ -264,50 +284,54 @@ class Publisher:
                 )
 
             # ---- change events: only those newer than the last successful push ----
-            since = self._events_since(market_state.get("events_watermark"), started_at)
-            event_rows = await self._event_rows(definition.slug, market_id, set(current), since)
-            async with self.store.transaction() as remote:
-                result.counts["change_events"] = await self.store.upsert(
-                    remote, "change_events", event_rows, conflict=("id",), do_nothing=True
+            result.counts["change_events"] = 0
+            if guard.allow_children:
+                since = self._events_since(market_state.get("events_watermark"), started_at)
+                event_rows = await self._event_rows(definition.slug, market_id, set(current), since)
+                async with self.store.transaction() as remote:
+                    result.counts["change_events"] = await self.store.upsert(
+                        remote, "change_events", event_rows, conflict=("id",), do_nothing=True
+                    )
+                result.rows_written += result.counts["change_events"]
+                await self._save_market_state(
+                    definition.slug, events_watermark=started_at.replace(tzinfo=None)
                 )
-            result.rows_written += result.counts["change_events"]
-            await self._save_market_state(
-                definition.slug, events_watermark=started_at.replace(tzinfo=None)
-            )
 
             # ---- small market-level payloads, each written only when its hash moved ----
-            snapshot_hashes: dict[str, str] = dict(market_state.get("snapshot_hashes") or {})
-            snapshots = []
-            if definition.is_demo:
-                for lens in LENSES:
-                    payload = build_demo_snapshot(definition, lens, properties, freshness)
-                    snapshot_digest = digest(payload)
-                    if snapshot_hashes.get(lens) != snapshot_digest:
-                        snapshots.append({
-                            "market_slug": definition.slug,
-                            "lens": lens,
-                            "payload": payload,
-                            "generated_at": self.now,
-                        })
-                        snapshot_hashes[lens] = snapshot_digest
-            daily = self._market_daily(market_id, score_rows, properties)
-            daily_digest = digest(daily)
-            write_daily = market_state.get("daily_hash") != daily_digest
-            async with self.store.transaction() as remote:
-                result.counts["demo_snapshots"] = await self.store.upsert(
-                    remote, "demo_snapshots", snapshots, conflict=("market_slug", "lens")
-                )
-                result.counts["market_daily"] = (
-                    await self.store.upsert(
-                        remote, "market_daily", [daily], conflict=("market_id", "day")
+            result.counts.update(demo_snapshots=0, market_daily=0)
+            if guard.allow_children:
+                snapshot_hashes: dict[str, str] = dict(market_state.get("snapshot_hashes") or {})
+                snapshots = []
+                if definition.is_demo:
+                    for lens in LENSES:
+                        payload = build_demo_snapshot(definition, lens, properties, freshness)
+                        snapshot_digest = digest(payload)
+                        if snapshot_hashes.get(lens) != snapshot_digest:
+                            snapshots.append({
+                                "market_slug": definition.slug,
+                                "lens": lens,
+                                "payload": payload,
+                                "generated_at": self.now,
+                            })
+                            snapshot_hashes[lens] = snapshot_digest
+                daily = self._market_daily(market_id, score_rows, properties)
+                daily_digest = digest(daily)
+                write_daily = market_state.get("daily_hash") != daily_digest
+                async with self.store.transaction() as remote:
+                    result.counts["demo_snapshots"] = await self.store.upsert(
+                        remote, "demo_snapshots", snapshots, conflict=("market_slug", "lens")
                     )
-                    if write_daily
-                    else 0
+                    result.counts["market_daily"] = (
+                        await self.store.upsert(
+                            remote, "market_daily", [daily], conflict=("market_id", "day")
+                        )
+                        if write_daily
+                        else 0
+                    )
+                result.rows_written += result.counts["demo_snapshots"] + result.counts["market_daily"]
+                await self._save_market_state(
+                    definition.slug, daily_hash=daily_digest, snapshot_hashes=snapshot_hashes
                 )
-            result.rows_written += result.counts["demo_snapshots"] + result.counts["market_daily"]
-            await self._save_market_state(
-                definition.slug, daily_hash=daily_digest, snapshot_hashes=snapshot_hashes
-            )
 
             # ---- freshness last, then heartbeat, run row (only if something moved), pruning ----
             result.counts["heartbeats"] = 1
@@ -338,7 +362,8 @@ class Publisher:
             await self._save_market_state(
                 definition.slug, last_push_at=finished_at.replace(tzinfo=None)
             )
-            await self._ping_healthcheck(failed=result.size_action == "page")
+            # Paging the owner: >= 420 MiB is already a stop-the-line condition.
+            await self._ping_healthcheck(failed=result.size_action in {"stop_new_cities", "page"})
             return result
         except BaseException as exc:
             await self._finish_failed_run(

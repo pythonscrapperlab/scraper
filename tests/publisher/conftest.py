@@ -154,7 +154,8 @@ async def reset(rig: Rig) -> None:
                 "(select id from properties where redfin_id like 'e6-%')"))
         await session.execute(delete(Property).where(Property.redfin_id.like("e6-%")))
         await session.execute(delete(MarketFreshness).where(MarketFreshness.slug == SLUG))
-        await session.execute(text("delete from serving.markets where slug = :slug"), {"slug": SLUG})
+        # The test database's serving schema belongs to the tests: clear every market's cascade.
+        await session.execute(text("delete from serving.markets"))
         await session.execute(text("delete from serving.heartbeats"))
         await session.execute(text("delete from serving.runs"))
         await session.execute(text("delete from serving.market_daily"))
