@@ -53,9 +53,9 @@ more `app.org_markets` rows than the plan allows.
 | Property page | `serving.v_property` | everything incl. `scores` JSON, `valuation_flags`, `features`, `schools`, `location_scores` | `property_id = :pid` |
 | Score anatomy panel | `v_property.scores -> :lens -> breakdown` | components with weight and subscore, adjustments (applied or not), flags, rationale | shape in `AGENTS.md` 6.2; render every row including "not triggered" |
 | Photos | `serving.images` | `url` | `property_id = :pid` order by `sort_order` (max 12) |
-| Sold comps | `serving.comps` | `address, price, beds, baths, sqft, sold_date` | `property_id = :pid` order by `sold_date desc` |
-| Price and status history | `serving.history` | `event_type, event, price, event_date, event_source, is_rental` | `property_id = :pid`, `is_rental = false`, order by `event_date desc` |
-| Tax history | `serving.tax_history` | `tax_year, tax_amount, assessed_value` | `property_id = :pid` order by `tax_year desc` (`assessed_value` is often null) |
+| Sold comps | `serving.comps` | `address, price, beds, baths, sqft, sold_date` | `property_id = :pid` order by `sold_date desc` (at most 6) |
+| Price and status history | `serving.history` | `event_type, event, price, event_date, event_source, is_rental` | `property_id = :pid`, order by `event_date desc` (at most 15 events, last 7 years; rentals are not published, so the `is_rental` filter is a no-op) |
+| Tax history | `serving.tax_history` | `tax_year, tax_amount, assessed_value` | `property_id = :pid` order by `tax_year desc` (latest 5 years; `assessed_value` is often null) |
 | Listing agent and broker | `serving.v_agent` | `listing_agent, listing_agent_phone, listing_broker, mls_id, source` | `property_id = :pid`; **empty result on Starter is normal** |
 | Market trend | `serving.market_daily` | `day, listings_active, tier_counts` | `market_id = :id` order by `day` |
 | Engine health in the UI | `serving.runs`, `v_market_public` | `kind, status, started_at, duration_s` | `market_id = :id` order by `started_at desc limit 20` |
@@ -65,9 +65,10 @@ more `app.org_markets` rows than the plan allows.
 | The org's markets | `app.org_markets` | `market_slug, enabled` | read by RLS; writes: section 5 |
 
 Notes: `<lens>` is one of `motivated_seller`, `fix_flip`, `buy_hold`, `str`, `airbnb`. `v_shortlist`
-excludes delisted listings; `v_property` keeps them for 30 days after delisting (`delisted_at`
-set), so a saved link to a sold home still renders. A property that stops appearing after 30 days
-has been pruned.
+excludes delisted listings; `v_property` keeps them for 7 days after delisting (`delisted_at`
+set), so a saved link to a sold home still renders. A property that stops appearing after 7 days
+has been pruned. An alert about a pruned property keeps its row (`app.alert_events.property_id` becomes `null`);
+render it from `payload` and do not link.
 
 **Adding a city.** Insert `app.org_markets (org_id, market_slug)`. Within 5 minutes the engine
 discovers it, runs a `warming` check and the first push creates the `serving.markets` row; until
@@ -127,3 +128,17 @@ of items is plan-based (5, 10, 15, 25). Deep links should use `property_id`.
 - Freshness is two-tier: search-level checks about every two hours 07:00-21:00 market-local, detail
   refresh nightly and immediately for changed listings. The laptop pushes; if it is offline the
   market goes `late` and the UI must say so.
+
+## 7. What changed in serving schema v3 (E6)
+
+The column set is unchanged; payload content is slimmer. See `docs/schema.md` ("Serving v3 payload contract").
+
+- `features.features` is now a curated object of at most 25 named keys (list in `docs/schema.md`), not the raw
+  amenities blob. Read missing keys as "unknown", never as "no".
+- `properties.description` is contact-redacted and at most 600 characters; `ai_summary` is redacted. Do not
+  try to re-add contact details; Pro agent contact comes only from `v_agent`.
+- `history` is at most 15 events / 7 years and has no rental rows; `tax_history` is 5 years; `comps` is 6.
+- `properties.dom`/`dom_mls`/`last_seen_at`/`refreshed_at` can lag on an unchanged listing (they travel with
+  the next real change). Prefer `listed_at` for an exact days-on-market and `markets.last_refreshed_at` for freshness.
+- `scores.breakdown` drivers have no `null` values and only carry `field` when it names a served column.
+- Delisted listings disappear after 7 days. `app.alert_events.property_id` may be `null` for a pruned property.

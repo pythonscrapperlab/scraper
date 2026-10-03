@@ -366,3 +366,37 @@ One row per day is upserted into the "E5 seven-day soak" table in `docs/progress
 row means the collector did not run; it is never back-filled. Without elevation the task runs only
 while the user is logged on.
 
+
+## Serving size: measure, rebuild, reclaim (E6)
+
+### Measure
+
+```powershell
+$env:PYTHONPATH = '.'; python scripts/serving_sizes.py <label>   # writes logs/e6/<label>.json
+```
+
+It prints `pg_database_size`, KB per published property, and per serving table: total / heap / TOAST / index KiB and `n_live_tup` / `n_dead_tup` (from `pg_stat_user_tables`). Raw SQL, run in the Supabase SQL editor:
+
+```sql
+select pg_size_pretty(pg_database_size(current_database()));
+select c.relname, pg_size_pretty(pg_total_relation_size(c.oid)) total,
+       s.n_live_tup live, s.n_dead_tup dead
+from pg_class c join pg_namespace n on n.oid = c.relnamespace
+left join pg_stat_user_tables s on s.relid = c.oid
+where n.nspname = 'serving' and c.relkind = 'r' order by pg_total_relation_size(c.oid) desc;
+```
+
+Estimate before pushing: `python scripts/measure_payload.py orlando-fl` (payload JSON per property, no network).
+
+### Reclaim after a slimming release
+
+Deleting rows frees space for reuse inside Postgres but does not shrink files; `VACUUM FULL` rewrites a table and does. **It takes an ACCESS EXCLUSIVE lock on the table for the duration**: the web's reads of that table wait (seconds for the small tables, tens of seconds for `scores`, `history`, `images`). Run it when nobody is watching, one table at a time, and never inside a transaction:
+
+1. Stop the scheduler (`scripts/service.ps1 stop -Elevate`) so no push is mid-flight.
+2. Apply pending Supabase migrations (`supabase db push --include-all`, or `python scripts/apply_supabase_migration.py <file>` where the CLI is missing).
+3. `python main.py publisher rebuild --all` (deletes each market's tree and re-sends it from local truth; alert history survives because `app.alert_events.property_id` is `ON DELETE SET NULL`).
+4. `python scripts/vacuum_serving.py` (VACUUM FULL ANALYZE each `serving.*` table, smallest first, prints the time each took).
+5. `python scripts/serving_sizes.py after` and compare with `before`.
+6. Start the scheduler again.
+
+Steady state needs none of this: autovacuum reclaims dead tuples, and the publisher no longer rewrites unchanged rows.

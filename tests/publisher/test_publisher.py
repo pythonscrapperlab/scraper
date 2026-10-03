@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from aevorex.db.models import MarketFreshness, Property, PropertyAnalysis
 from aevorex.publisher.remote import RemoteStore
-from aevorex.publisher.service import Publisher, apply_rejections, retained_delisted
+from aevorex.publisher.service import Publisher, apply_rejections
 from aevorex.publisher.snapshots import build_demo_snapshot
 from aevorex.publisher.types import MarketDefinition, PublishResult, classify_size
 
@@ -27,14 +27,6 @@ from aevorex.publisher.types import MarketDefinition, PublishResult, classify_si
 )
 def test_size_guard_exact_thresholds(megabytes: float, action: str) -> None:
     assert classify_size(round(megabytes * 1024 * 1024)).action == action
-
-
-def test_delisted_retention_includes_exact_30_day_boundary() -> None:
-    now = datetime(2026, 10, 3, 12, tzinfo=UTC)
-    assert retained_delisted(None, now)
-    assert retained_delisted(now - timedelta(days=30), now)
-    assert retained_delisted(now - timedelta(days=29), now)
-    assert not retained_delisted(now - timedelta(days=30, microseconds=1), now)
 
 
 def _scored_property(position: int) -> Property:

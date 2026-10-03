@@ -10,6 +10,8 @@ and were applied to the linked project with `supabase db push` on 2026-10-03.
 | `20261003120000_e5_alerts` | Additive `app.*` columns for alerts, quiet hours, brief |
 | `20261003120100_e5_views` | The four `serving.v_*` views and `change_events(property_id, observed_at)` index |
 | `20261003121000_e5_fast_policies` | Same policies, rewritten so Postgres evaluates them once per statement |
+| `20261004090000_e6_serving_v3` | `serving.schema_version` = 3; `app.alert_events.property_id` nullable, FK `ON DELETE SET NULL` |
+| `20261004091000_e6_security` | Revoke execute on `public.rls_auto_enable()` from `public`, `anon`, `authenticated` |
 
 ## Views
 
@@ -21,7 +23,7 @@ explicit list, so a column added to a base table later does not leak through a v
 |---|---|---|---|
 | `serving.v_market_public` | anon, authenticated | one row per active market | the 12 public market columns: `slug, city, state, tz, active, is_demo, last_checked_at, next_check_at, last_refreshed_at, check_status, listings_active, changed_last_check` |
 | `serving.v_shortlist` | authenticated | one row per **listed** property (`delisted_at is null`) | identity and facts, `price`, `dom`, `refreshed_at`, `photo_count`; for each lens `<lens>_score`, `<lens>_grade`, `<lens>_percentile`, `<lens>_tier` (20 columns, `null` when that lens could not be scored); `latest_change_kind`, `latest_change_at` |
-| `serving.v_property` | authenticated | one row per property (including delisted within 30 days) | all `properties` columns, the whole `valuation` row (its `flags` as `valuation_flags`), `features`, `schools`, `location_scores`, `transport_count`, market freshness (`market_last_checked_at`, `market_last_refreshed_at`, `market_tz`), and `scores` - a JSON object keyed by lens holding `score, grade, percentile, confidence, tier, prev_score, prev_percentile, rationale, flags, breakdown, version, computed_at` |
+| `serving.v_property` | authenticated | one row per property (including delisted within 7 days) | all `properties` columns, the whole `valuation` row (its `flags` as `valuation_flags`), `features`, `schools`, `location_scores`, `transport_count`, market freshness (`market_last_checked_at`, `market_last_refreshed_at`, `market_tz`), and `scores` - a JSON object keyed by lens holding `score, grade, percentile, confidence, tier, prev_score, prev_percentile, rationale, flags, breakdown, version, computed_at` |
 | `serving.v_agent` | authenticated, **Pro+ only by RLS** | one row per property with agent data | `listing_agent, listing_agent_phone, listing_broker, mls_id, source`, `market_slug` |
 
 Lens keys are the DB codes: `motivated_seller`, `fix_flip`, `buy_hold`, `str` (mid-term, 30+ days),
@@ -88,3 +90,42 @@ both are the correct plan at this size.
   org-local day from 07:00 until 11:00 local (later than that it is skipped and counted as
   `brief_too_late`, never sent stale). The count of properties depends on plan:
   starter 5, pro 10, growth 15, brokerage 25 (`config/scheduler.yaml`).
+
+## Serving v3 payload contract (E6)
+
+Version 3 changes the **content** of existing columns, not the column set. The publisher sends only what the
+web renders, and only when it changed (a property whose row, scores or child rows hash identically to the last
+successful push is not touched).
+
+| Table / column | v3 content |
+|---|---|
+| `properties.description` | Contact details removed, then capped at **600 characters** (word boundary, ends with an ellipsis). Removed: phone numbers, e-mail addresses, web addresses, social handles and "call/text/contact/e-mail/ask for/speak with `<person>`" phrases (replaced by "contact the listing agent"; numbers and addresses by `[contact removed]`). Generic wording such as "call home" or "contact the listing agent" is kept. Not detected: spelled-out digits and "name at example dot com". `listing_url` is unchanged (public Redfin page). |
+| `properties.ai_summary` | Same redaction, no cap (longest observed is 668 characters). |
+| `properties.dom`, `dom_mls`, `last_seen_at`, `refreshed_at`, `updated_at` | Written whenever the row is written, but **a change in these alone does not trigger a write**. On an otherwise unchanged listing they are as of the last real change: derive days-on-market from `listed_at` where exactness matters, and use the market's `last_refreshed_at` as the freshness surface. |
+| `features.features` | A curated object of at most **25** named keys, only those with a value (values are trimmed strings, at most 160 characters). There is **no** raw amenities blob. See the list below. |
+| `history` | Sale and listing events only (**never rentals**; the web filters them out anyway), newest first, **at most 15 events within the last 7 years**. |
+| `tax_history` | The latest **5** tax years. |
+| `comps` | At most **6** sold comps, most recent sale first. |
+| `images` | Unchanged: first 12. |
+| `scores.breakdown` | Same shape as `AGENTS.md` 6.2. Drivers with a `null` value are dropped; a driver's `field` is kept only when it names a column the web already holds (`serving.properties`, `serving.valuation`, or a flag key), otherwise it is removed. Components, weights, subscores and adjustments are untouched, so `recompose(breakdown)` still equals `score`. |
+| `change_events` | Only events newer than the market's last successful push are sent (the first push of a market sends the last 14 days). |
+| `market_daily`, `runs`, `heartbeats` | Pruned remotely to 90, 30 and 7 days. |
+| Delisted properties | Kept **7 days** after `delisted_at` (was 30), then removed with their children. |
+
+### The 25 feature keys
+
+Structured (13): `heating`, `cooling`, `flooring`, `construction_material`, `roof`, `foundation`,
+`interior_features`, `appliances`, `laundry_features`, `water_source`, `sewer`, `utilities`, `furnished`.
+
+From the listing's amenities (12): `style`, `levels`, `exterior_features`, `parking_features`,
+`garage_spaces`, `pool`, `fireplace`, `waterfront`, `pets_allowed`, `hoa_includes`, `hoa_amenities`,
+`property_condition`.
+
+Deliberately not published: `Directions`, `Attribution Contact`, virtual-tour URLs, universal property ids, APNs,
+school names (already in `neighbourhood`), and every other raw key. Adding a key is a code change in
+`aevorex/publisher/slim.py` and a size decision.
+
+### Alert history survives prunes
+
+`app.alert_events.property_id` is nullable with `ON DELETE SET NULL`. A pruned or rebuilt property keeps its
+alert rows (address and price live in `payload`); the web must handle a `null` `property_id` by not linking.

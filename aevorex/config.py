@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     scraper_retry_delay: int = 5  # seconds
     scraper_concurrent_urls: int = 3  # Conservative detail-page concurrency
     refresh_batch_size: int = 150  # Detail URLs fetched, written and settled per batch
+    # A search snapshot smaller than this fraction of the previous complete one is
+    # treated as a failed fetch (partial pages / block pages), not as mass delisting.
+    check_min_snapshot_ratio: float = 0.7
 
     # === Transport: Playwright ===
     playwright_headless: bool = True
