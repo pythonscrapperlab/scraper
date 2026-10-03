@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+# Serving schema version this publisher writes; checked against serving.schema_version.
+SCHEMA_VERSION = 2
+
 SizeAction = Literal["ok", "warn", "stop_new_cities", "page"]
 
 
@@ -50,6 +53,7 @@ class PublishResult:
     market: str
     status: Literal["succeeded", "partial"] = "succeeded"
     counts: dict[str, int] = field(default_factory=dict)
+    rows_written: int = 0
     rejected_property_ids: list[str] = field(default_factory=list)
     size_action: SizeAction = "ok"
 
@@ -57,5 +61,6 @@ class PublishResult:
         """Return only aggregate values for PII-free CLI tracking."""
         result: dict[str, int | float | bool] = dict(self.counts)
         result["partial"] = self.status == "partial"
+        result["remote_rows_written"] = self.rows_written
         result["rejected_scores"] = len(self.rejected_property_ids)
         return result

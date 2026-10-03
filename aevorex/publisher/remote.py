@@ -5,18 +5,25 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import MetaData, Table, delete, func, inspect, select, text
+from sqlalchemy import ARRAY, MetaData, Table, bindparam, delete, func, inspect, select, text
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from aevorex.config import settings
+from aevorex.publisher.types import SCHEMA_VERSION
 
 JsonRow = Mapping[str, Any]
+
+# Append-only serving tables are capped remotely so a long soak stays flat.
+PRUNE_MARKET_DAILY_DAYS = 90
+PRUNE_RUNS_DAYS = 30
+PRUNE_HEARTBEATS_DAYS = 7
 
 EXPECTED_COLUMNS: dict[str, set[str]] = {
     "markets": set("id city state region_id slug tz zips active is_demo check_cadence_minutes last_checked_at next_check_at last_refreshed_at check_status listings_active changed_last_check pool_size source_status updated_at".split()),
@@ -75,7 +82,7 @@ class RemoteStore:
         self.tables: dict[str, Table] = {}
 
     async def initialize(self) -> None:
-        """Reflect only the serving schema and verify schema version 2."""
+        """Reflect only the serving schema and verify the expected schema version."""
         async with self.engine.connect() as connection:
             await connection.run_sync(
                 lambda sync: self.metadata.reflect(bind=sync, schema="serving")
@@ -89,7 +96,7 @@ class RemoteStore:
             if required - self.tables.keys():
                 raise RuntimeError("ServingSchemaDrift")
             version = await connection.scalar(select(self.table("schema_version").c.version))
-            if version != 2:
+            if version != SCHEMA_VERSION:
                 raise RuntimeError("ServingSchemaVersionMismatch")
 
     def table(self, name: str) -> Table:
@@ -111,6 +118,7 @@ class RemoteStore:
         *,
         conflict: Sequence[str],
         preserve_previous_scores: bool = False,
+        do_nothing: bool = False,
     ) -> int:
         """Upsert rows in bounded multi-value statements."""
         if not rows:
@@ -142,7 +150,9 @@ class RemoteStore:
                 )
                 if part
             )
-        action_sql = f"do update set {update_sql}" if update_sql else "do nothing"
+        action_sql = (
+            f"do update set {update_sql}" if update_sql and not do_nothing else "do nothing"
+        )
         statement = text(
             f'insert into serving."{table_name}" as target ({quoted_columns}) '
             f'select {quoted_columns} from jsonb_populate_recordset('
@@ -152,11 +162,12 @@ class RemoteStore:
         effective_batch = self.batch_size
         for offset in range(0, len(rows), effective_batch):
             chunk = [dict(row) for row in rows[offset : offset + effective_batch]]
-            await connection.execute(
+            outcome = await connection.execute(
                 statement,
                 {"payload": json.dumps(chunk, default=_json_default, separators=(",", ":"))},
             )
-            total += len(chunk)
+            # DO NOTHING reports only the rows really inserted; repeats must count as zero.
+            total += int(outcome.rowcount or 0) if do_nothing else len(chunk)
         return total
 
     async def database_size(self, connection: AsyncConnection) -> int:
@@ -184,6 +195,73 @@ class RemoteStore:
             }
 
         return await connection.run_sync(columns)
+
+    async def property_ids(self, connection: AsyncConnection, market_id: Any) -> set[UUID]:
+        """Ids of the properties the cache holds for one market (a read, not a write)."""
+        table = self.table("properties")
+        rows = await connection.execute(select(table.c.id).where(table.c.market_id == market_id))
+        return {row[0] for row in rows}
+
+    async def delete_by_ids(
+        self, connection: AsyncConnection, table_name: str, column: str, ids: Sequence[Any]
+    ) -> int:
+        """Delete rows whose ``column`` is in ``ids``; issues no statement for an empty set."""
+        if not ids:
+            return 0
+        table = self.table(table_name)
+        total = 0
+        for offset in range(0, len(ids), 1000):
+            result = await connection.execute(
+                delete(table).where(table.c[column].in_(list(ids[offset : offset + 1000])))
+            )
+            total += int(result.rowcount or 0)
+        return total
+
+    async def delete_stale_scores(
+        self,
+        connection: AsyncConnection,
+        property_ids: Sequence[Any],
+        keep: Sequence[tuple[Any, str]],
+    ) -> int:
+        """For these properties only, drop lens rows that are no longer published."""
+        if not property_ids:
+            return 0
+        payload = json.dumps(
+            [{"property_id": pid, "lens": lens} for pid, lens in keep],
+            default=_json_default,
+            separators=(",", ":"),
+        )
+        result = await connection.execute(
+            text(
+                "delete from serving.scores as score where score.property_id = any(:ids) "
+                "and not exists (select 1 from jsonb_to_recordset(cast(:payload as jsonb)) "
+                "as kept(property_id uuid,lens text) where kept.property_id=score.property_id "
+                "and kept.lens=score.lens)"
+            ).bindparams(bindparam("ids", type_=ARRAY(PGUUID))),
+            {"ids": list(property_ids), "payload": payload},
+        )
+        return int(result.rowcount or 0)
+
+    async def prune_old(self, connection: AsyncConnection, now: datetime) -> dict[str, int]:
+        """Cap the append-only tables; checks first so a clean table costs no write."""
+        limits = (
+            ("market_daily", "day", PRUNE_MARKET_DAILY_DAYS),
+            ("runs", "started_at", PRUNE_RUNS_DAYS),
+            ("heartbeats", "at", PRUNE_HEARTBEATS_DAYS),
+        )
+        removed: dict[str, int] = {}
+        for name, column, days in limits:
+            table = self.table(name)
+            moment = now - timedelta(days=days)
+            cutoff: datetime | date = moment.date() if name == "market_daily" else moment
+            stale = await connection.scalar(
+                select(func.count()).select_from(table).where(table.c[column] < cutoff)
+            )
+            if not stale:
+                continue
+            result = await connection.execute(delete(table).where(table.c[column] < cutoff))
+            removed[name] = int(result.rowcount or 0)
+        return removed
 
     async def delete_market_properties(
         self, connection: AsyncConnection, market_id: Any, keep_ids: Sequence[Any]

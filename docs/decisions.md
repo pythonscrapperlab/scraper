@@ -300,3 +300,21 @@ Audit 2026-10-03 found correctness bugs and a publisher that sent far more than 
 - Ingestion parser bugs.
 - Stale README / CLAUDE.md.
 - Backfill of the 1,397 `v1` valuation rows (changes their scores).
+
+### Step 2 - needs_analysis false positives
+
+`Deduplicator.upsert` stamped `last_seen_at = now` before `session.is_modified(...)`, so every re-scrape of an identical record looked modified and re-queued the property for analysis. `last_seen_at` is now stamped after the check. DB test: identical re-upsert leaves `needs_analysis=False`; a price change sets it True (fails without the fix).
+
+### Step 3 - snapshot sanity guard
+
+`apply_snapshot` raises `SnapshotRejected` before any write when the previous complete snapshot had listings and the new one is empty or below `CHECK_MIN_SNAPSHOT_RATIO` (default 0.7) of it. No events, no absence counting, no `last_checked_at` advance; `run_check` marks the market `failed`. The ratio is logged on every check. "Previous complete snapshot" is `market_freshness.listings_active`, which only an accepted snapshot writes, and only counts once `last_checked_at` is set (first-ever check is always accepted). The E2 two-absence test used an empty snapshot and was changed to a five-to-four shrink.
+
+### Step 4 - publisher sends only what changed
+
+- New local tables `publish_state` (per property: content / scores / children hashes) and `publish_market_state` (events watermark, market/daily/demo-snapshot hashes). Alembic `e6b3d5f7a9c1`.
+- The hash covers the exact serving payload, **minus volatile stamps** `updated_at, last_seen_at, refreshed_at, dom, dom_mls` (scores: `computed_at`, `prev_*`; children: `computed_at`). A nightly refresh re-stamps those on every listing, so hashing them re-sends the whole market nightly. **Consequence for the web:** on an unchanged listing these columns are as of the last real change; days-on-market should be derived from `listed_at` where it matters, and market-level `last_refreshed_at` remains the honest freshness surface. Owner call if you would rather pay for exact `dom` (the cheap alternative is a weekly staggered re-push of the properties row).
+- A property absent from the cache is re-sent in every group whatever the local state says, so a manual delete or rebuild self-heals. Departures are the cache ids not in the local keep-set.
+- Events: only `observed_at` after the market's watermark (minus a 10-minute overlap; inserts are `ON CONFLICT DO NOTHING` and report true row counts). First push of a market sends 14 days.
+- The `markets` row, `market_daily` and each demo snapshot are written only when their hash moved. The run row is written once, at the end, and only if something was written (no more `running` row plus an update). Failed pushes record a failed run row.
+- Remote pruning on every push: `market_daily` 90 d, `runs` 30 d, `heartbeats` 7 d (counted first, so a clean table costs no write). `change_events` is not pruned (not in scope; ~1 MB/week at current volume; follow-up).
+- Proof: two consecutive no-change pushes issue only `update serving.markets` and `insert serving.heartbeats` (statement-level recording on the engine in `tests/publisher/test_incremental.py`).
