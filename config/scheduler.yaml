@@ -27,6 +27,12 @@ service:
   nightly_finalize_tz: "America/New_York"
   nightly_finalize_max_wait_minutes: 150
   seconds_per_listing_estimate: 0.6   # capacity preview fallback until runs exist
+  brief_sweep_minutes: 10         # morning-brief sweep; due 07:00-11:00 org-local, idempotent
+  brief_counts:                   # properties per morning brief, by plan
+    starter: 5
+    pro: 10
+    growth: 15
+    brokerage: 25
   job_timeout_minutes:
     check: 15
     refresh: 240

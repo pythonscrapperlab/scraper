@@ -9,7 +9,7 @@ Commands:
 - analyze --changed
 - analyze            (market-stats -> value -> score, in the only order that works)
 - market-stats / value / score   (the individual stages)
-- scheduler run | preview | run-now | clock-check | soak-start | soak-report
+- scheduler run | preview | run-now | clock-check | soak-start | soak-report | soak-daily
 """
 
 import asyncio
@@ -556,6 +556,56 @@ async def _soak_report(label: str, append: bool) -> None:
         click.echo("Appended to docs/progress.md")
     else:
         click.echo(markdown)
+
+
+@scheduler_group.command("soak-daily")
+@click.option("--label", default="e5-7d", show_default=True, help="Soak label")
+@click.option("--hours", default=24, show_default=True, help="Trailing window length")
+@click.option("--append/--print-only", default=True, help="Upsert today's row in docs/progress.md")
+def scheduler_soak_daily(label: str, hours: int, append: bool) -> None:
+    """Record one day of soak metrics (checks, refreshes, blocks, DB size, late events)."""
+    _run_untracked(lambda: _soak_daily(label, hours, append))
+
+
+async def _soak_daily(label: str, hours: int, append: bool) -> None:
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from sqlalchemy import text
+
+    from aevorex.scheduler import report, soak
+
+    now = datetime.now(UTC)
+    start_file = report.start_path(label)
+    if start_file.exists():
+        started = datetime.fromisoformat(report.read_start(label)["started_at"])
+    else:
+        started = now
+        report.write_start(label, {}, started)  # day 0: the soak starts when first recorded
+    window_start, window_end = soak.window_for(now, hours)
+    runs = await report.load_runs(window_start)
+    async with async_session_maker() as session:
+        local_bytes = int(await session.scalar(text("select pg_database_size(current_database())")) or 0)
+    cloud: float | None = None
+    try:
+        cloud = float((await _with_publisher("status"))["database_size_mb"])
+    except Exception as exc:  # the soak row must still be written, with the gap stated
+        logger.warning("Cloud size unavailable for soak row: error_class=%s", type(exc).__name__)
+    metrics = soak.summarize_day(
+        runs, soak.read_log_lines(soak.log_files(), window_start),
+        day=now.astimezone().date(), start=window_start, end=window_end,
+        local_db_bytes=local_bytes, cloud_db_mib=cloud,
+    )
+    row = soak.render_row(metrics)
+    if not append:
+        click.echo(row)
+        return
+    path = Path("docs/progress.md")
+    document = path.read_text(encoding="utf-8") if path.exists() else ""
+    path.write_text(
+        soak.upsert_row(document, row, metrics.day, label=label, started=started), encoding="utf-8"
+    )
+    click.echo(f"Soak row for {metrics.day} written to docs/progress.md")
 
 
 def _run_untracked(operation: Callable[[], Awaitable[None]]) -> None:

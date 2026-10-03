@@ -82,6 +82,8 @@ docs/*
 !docs/decisions.md
 !docs/progress.md
 !docs/runbook.md
+!docs/schema.md
+!docs/handover-web.md
 *output
 old.env
 raw.ipynb

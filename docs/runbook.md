@@ -141,6 +141,7 @@ Nothing calls the laptop; it pushes outbound only. **It never sends email.**
 | 06:30 America/New_York `finalize` | wait for nightly refreshes, `market-stats` (if >20 h old), catch-up analyze, push if anything changed |
 | Every 5 min | discovery (new city -> `warming` check at once), late detector, queue drainer |
 | Every 10 min | heartbeat (Healthchecks + `serving.heartbeats`), retry failed pushes |
+| Every 10 min | morning-brief sweep (queues briefs due 07:00-11:00 org-local) |
 | Every 60 min | clock-drift check |
 
 Active cities = enabled rows in `app.org_markets` plus `config/demo_markets.yaml`. Cadence,
@@ -310,3 +311,58 @@ python main.py scheduler soak-report --label e4-48h     # appends status before/
 ```
 
 `soak-report --print-only` previews the Markdown without touching `docs/progress.md`.
+
+## Alerts, morning brief, RLS proof and soak (E5)
+
+Alerts are evaluated inside `publisher push` (same transaction as the scores) and the brief by the
+scheduler's 10-minute sweep. Both only **queue** rows in `app.alert_events` / `app.email_queue`;
+the web's sender delivers them and honours `send_after`. Nothing in this repository sends mail.
+
+Check what was queued (counts only, no addresses):
+
+```powershell
+python main.py publisher status
+python main.py scheduler soak-daily --print-only        # today's metrics, nothing written
+```
+
+Brief sizes by plan live in `config/scheduler.yaml` (`service.brief_counts`); restart to apply.
+If a brief did not arrive: check the org's `tz`, that a member has `morning_brief` and `email` on
+(or no settings row), that the market has scores, and that the sweep ran between 07:00 and 11:00
+org-local (a later brief is skipped on purpose).
+
+### Applying the E5 migrations
+
+```powershell
+npx --yes supabase@2.118.0 db push --dry-run
+npx --yes supabase@2.118.0 db push
+```
+
+### RLS proof
+
+```powershell
+python -m pytest tests/rls -q                                   # local, always on
+$env:AEVORAEX_LIVE_TESTS = '1'; python -m pytest tests/rls/test_live_supabase.py -q   # live, rolled back
+```
+
+The live admin-API variant additionally needs `SUPABASE_SERVICE_ROLE_KEY` in `.env` (tests only;
+it creates two confirmed throwaway users, sends no e-mail, and deletes them). Without the key it is
+skipped and says so.
+
+### View performance
+
+```powershell
+$env:PYTHONPATH = '.'; python scripts/explain_views.py orlando-fl          # timings only
+python scripts/explain_views.py orlando-fl --plans                           # full plans
+```
+
+### Seven-day soak
+
+```powershell
+powershell -File scripts\install-soak-task.ps1 -Label e5-7d       # daily 23:55; elevated = SYSTEM
+python main.py scheduler soak-daily --label e5-7d                   # run one row by hand
+```
+
+One row per day is upserted into the "E5 seven-day soak" table in `docs/progress.md`. A day with no
+row means the collector did not run; it is never back-filled. Without elevation the task runs only
+while the user is logged on.
+

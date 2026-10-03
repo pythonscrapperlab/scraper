@@ -58,6 +58,10 @@ class ServiceSettings:
     nightly_finalize_tz: str = "America/New_York"
     nightly_finalize_max_wait_minutes: int = 150
     seconds_per_listing_estimate: float = 0.6
+    brief_sweep_minutes: int = 10
+    brief_counts: dict[str, int] = field(
+        default_factory=lambda: {"starter": 5, "pro": 10, "growth": 15, "brokerage": 25}
+    )
     job_timeout_minutes: dict[str, int] = field(
         default_factory=lambda: {"check": 15, "refresh": 240, "analyze": 90, "publish": 20}
     )
@@ -133,6 +137,8 @@ def parse_config(raw: dict[str, Any] | None) -> ScheduleConfig:
             service_values[key] = _time(value, key)
         elif key == "job_timeout_minutes":
             service_values[key] = {**base.job_timeout_minutes, **{k: int(v) for k, v in value.items()}}
+        elif key == "brief_counts":
+            service_values[key] = {**base.brief_counts, **{str(k): int(v) for k, v in value.items()}}
         elif key == "nightly_finalize_tz":
             ZoneInfo(str(value))
             service_values[key] = str(value)
