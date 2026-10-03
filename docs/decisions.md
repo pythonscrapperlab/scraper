@@ -127,3 +127,101 @@
 - **The size guard uses binary MiB.** Warn at 350, stop new cities at 420, page at 450.
 - **Wake is readiness-only.** It writes a heartbeat and optional Healthchecks ping;
   it schedules no work and never invokes the E5 email queue.
+
+## 2026-10-03 — E4 scheduler on Windows
+
+- **The legacy state-wide scheduler is gone.** `scheduler/jobs.py` scraped whole states on a
+  six-hour interval and was disabled by default. It is replaced by per-city slot jobs; the
+  `SCHEDULER_*_INTERVAL_HOURS` settings are removed. `main.py scheduler` is now a command
+  group (`run`, `preview`, `run-now`, `clock-check`, `soak-start`, `soak-report`).
+- **One slot function drives both the service and the preview.** `slots.slots_for_day` is the
+  only place fire times are computed; `SlotTrigger` adapts it to APScheduler and
+  `scheduler preview` calls it directly, so the preview cannot disagree with the service.
+  A test proves the trigger sequence equals the plan.
+- **Slots are market-local wall-clock times.** Daytime checks run 07:00-21:00 every 120 min
+  (inclusive of 21:00), plus one 03:00 check; the nightly refresh is 02:00. DST: a wall time
+  inside the spring-forward gap fires once, an hour later (02:00 -> 03:00); a fall-back
+  ambiguous time fires once, at its first occurrence. Every day keeps exactly nine check slots.
+- **Stagger is a stable hash, not jitter.** `sha256(slug + sorted zips) % 30` minutes is added
+  to every slot of a market, so restarts and previews agree and cities spread across the hour.
+  The zip list comes from `uscities.csv` (static), not from live inventory, so it cannot drift.
+- **Concurrency is enforced by PostgreSQL advisory locks, not in-process semaphores.** The
+  service and `run-now` are separate processes. Lanes: `check`, `refresh`, `analyze`
+  (market-stats, valuation, scoring) and `publish`, plus a `service` single-instance lock. A
+  check and a refresh may overlap (AGENTS.md section 9); two checks or two refreshes may not.
+- **One chain, one implementation.** `JobRunner` is called by APScheduler, `run-now` and the
+  tests. Stage order: check -> push freshness (light) -> if anything was queued: refresh ->
+  analyze -> full push. A check that found nothing costs one row update, not a 40-70 s push.
+- **A queue-wide refresh publishes every market it touched.** `refresh_pending` claims due
+  rows for all markets, so after it the chain publishes each market that had rows waiting, not
+  only the one whose check triggered it.
+- **A queue drainer runs every 5 minutes.** Rows left by a restart, a cancelled run or a
+  failed attempt are worked off without waiting for the next check or the nightly refresh.
+  Rows stuck in `processing` are returned to `pending` only while holding the refresh lane,
+  when nothing can legitimately be mid-flight.
+- **Redfin backoff is one shared state.** Any incomplete check, failed refresh, refresh with
+  zero successes, or block rate >= 50% counts as a source failure: 5 -> 10 -> 20 -> 40 -> 80
+  minutes, capped at 120 (the same series as the E2 per-row backoff). A one-shot retry job is
+  scheduled at the end of the delay. Manual `run-now` bypasses backoff and pause.
+- **Supabase being down never stops scraping.** Failed pushes are remembered in `publish_debt`
+  and retried on the 10-minute heartbeat. Remote status writes are best-effort.
+- **Late means a missed slot, not a missed cadence.** A market is `late` when the latest
+  scheduled check slot is older than 30 minutes and no completed check came at or after it.
+  Slots before a market was discovered are ignored, so a new city is `warming`. `failed` is
+  never downgraded to `late`. A late market triggers one catch-up check (unless backing off).
+- **`next_check_at` is the real next slot.** The E2 check stamped `now + 120 min`, which is
+  wrong across the 21:00-03:00 and 03:00-07:00 gaps; the scheduler overwrites it after each
+  successful check.
+- **Market-stats is once per night, after the refreshes.** The 06:30 America/New_York
+  `finalize` job waits (up to 150 minutes) for in-flight nightly refreshes, then rebuilds
+  baselines if the last run is older than 20 hours and runs a catch-up analyze. As in E2,
+  rebuilt baselines affect only rows analysed afterwards; no full revaluation is triggered.
+- **E2 amendment: days-on-market drift no longer queues a detail fetch.** DOM rises by one
+  every day, so the first check of each day re-queued essentially every listing (2,243 of
+  Orlando's 2,565) and doubled the nightly refresh. DOM now queues only if it appeared,
+  vanished or decreased, or the listing date moved. Price, status, relist and new events are
+  unchanged. Cost matters: the proxy is residential and metered per GB.
+- **Active cities honour `app.org_markets.enabled` only.** The E0 `app.orgs` stub has a plan
+  but no trial/active status, so AGENTS.md's "orgs trialing|active" filter cannot be applied.
+  A market in `app.org_markets` with no Redfin region id is reported as unschedulable, never
+  silently ignored. A Supabase read failure keeps the last known org markets.
+- **Miami and Tampa are enabled in `scrapers/constants.py`** (region ids 11458 and 18142, from
+  the previously commented entries) because two of the five demo cities could not run
+  otherwise. First live checks: Miami 4,299 listings / 13 pages, Tampa 2,204 / 7.
+- **Logging is JSON, scrubbed and class-only.** Daily rotation (30 days). URLs, e-mail
+  addresses, phone numbers and street addresses are redacted from every message; exception
+  text and tracebacks are never written, only the class. Sentry runs with PII off, no
+  breadcrumbs or locals, exception messages blanked, and `before_send` scrubbing.
+- **Every external integration is optional.** Sentry, the Healthchecks heartbeat/run/backup
+  URLs and the Supabase org read are no-ops when unset; `SUPABASE_DIRECT_CONNECTION_URL`
+  unset means demo markets only and nothing is published.
+- **The service runs as LocalSystem.** It needs no user profile or interactive session, and
+  starts delayed-automatic after PostgreSQL. NSSM restarts it 15 s after any exit; Windows
+  recovery actions are a second safety net. Stop is Ctrl+C with a 60 s window; in-flight
+  jobs are cancelled after 10 s and their ledger rows close as failed.
+- **Backups are same-machine and stay so until an off-machine target exists.** The nightly
+  task dumps to `D:\aevorex-backups` (not the DB's own directory tree), verifies with
+  `pg_restore --list`, and keeps seven. This protects against a bad migration, not against
+  losing the laptop; the runbook names that gap.
+- **`scripts/free-disk.ps1` is not delivered here.** AGENTS.md lists it under section 9 but
+  assigns the disk work to E0; it does not exist in the repository, and E4 was not asked to
+  build it. Disk headroom (6.7 GiB free on D:) is tracked in the runbook.
+- **E2 amendment: detail refresh works in batches of 150.** `PipelineRunner.run_scrape`
+  fetches and parses its whole URL list in memory and writes only afterwards, so a 7,303-URL
+  refresh made no durable progress for hours and lost everything (and the proxy bandwidth) on
+  any restart or cancel - the "one crash lost all processed data" gotcha. `run_refresh` now
+  feeds it `REFRESH_BATCH_SIZE` URLs at a time and settles the queue rows after each batch.
+  Proven by tests: a cancel mid-run keeps finished batches and orphans only the rest.
+- **The post-check refresh is its own job.** A refresh can wait hours for the single refresh
+  lane. If it ran inside the check job, APScheduler would skip every later check slot of that
+  market ("max instances reached") and the market would go `late` while the service was busy.
+  In the service the check job ends after the light push and schedules `post-check:<market>`;
+  `run-now` still runs the whole chain inline.
+- **Measured detail-refresh throughput (live, 2026-10-03, concurrency 3):** about 1.4 MB per
+  property page, 3.9 s to fetch, 0.25 s to parse, 0.13 s to write; a 150-URL batch took 281 s
+  (1.9 s/URL, about 0.53 URL/s). Fetch time dominates; the CPU is about 20% busy. A full refresh
+  of the five demo cities (about 10,700 listings) is therefore about 5.6 hours, longer than the
+  02:00-07:00 budget; `scheduler preview` reports this once whole-city refresh runs exist.
+  This is recorded, not hidden: the founder decides between more concurrency (AGENTS.md allows
+  4, watch the 405/block rate), fewer cities, or refreshing only listings that changed.
+

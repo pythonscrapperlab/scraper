@@ -1,0 +1,40 @@
+# AevoraeX scheduler configuration (AGENTS.md section 7 and 9).
+# Everything here is a default; any key may be overridden per market under `markets:`.
+# Times are market-local wall-clock times (the market's IANA timezone from uscities.csv).
+
+defaults:
+  check_cadence_minutes: 120      # search-level check cadence inside the window
+  window_start: "07:00"           # first daytime check slot
+  window_end: "21:00"             # last daytime check slot (inclusive)
+  overnight_check: "03:00"        # one extra check overnight; null disables
+  nightly_refresh: "02:00"        # full detail refresh; null disables
+  stagger_minutes: 30             # slots shift by hash(slug + zips) % stagger_minutes
+
+service:
+  discovery_minutes: 5            # active-city discovery; a new city warms within this
+  late_detector_minutes: 5
+  late_grace_minutes: 30          # a market is `late` this long after a missed slot
+  heartbeat_minutes: 10
+  clock_check_minutes: 60
+  clock_warn_seconds: 5
+  clock_fail_seconds: 30
+  misfire_grace_minutes: 30       # coalesce slots missed while asleep/offline into one run
+  backoff_base_minutes: 5         # 5 -> 10 -> 20 -> 40 -> 80 -> cap
+  backoff_cap_minutes: 120
+  block_rate_backoff: 0.5         # a refresh with a higher block rate counts as a failure
+  market_stats_min_interval_hours: 20
+  nightly_finalize: "06:30"       # market-stats once per night after the nightly refreshes
+  nightly_finalize_tz: "America/New_York"
+  nightly_finalize_max_wait_minutes: 150
+  seconds_per_listing_estimate: 0.6   # capacity preview fallback until runs exist
+  job_timeout_minutes:
+    check: 15
+    refresh: 240
+    analyze: 90
+    publish: 20
+
+# Per-market overrides, e.g.:
+# markets:
+#   san-jose-ca:
+#     check_cadence_minutes: 180
+markets: {}

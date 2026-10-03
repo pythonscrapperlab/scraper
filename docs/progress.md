@@ -97,3 +97,35 @@ Status: implemented; live push and final verification are recorded in the handof
   recomposition rejections. Remote database size after both markets was 88.09 MiB.
 - Final verification: `ruff check .` passed; Mypy reported no issues across 71 source
   files; Pytest passed 305/305 tests, including 11 focused publisher tests.
+
+## 2026-10-03 — E4 scheduler on Windows
+
+Status: implemented, installed and running; the 48-hour soak is **in progress** (see below).
+
+- Branch `feat/e4-scheduler`. New strict-typed `aevorex.scheduler` package replaces the legacy
+  state-wide scheduler: market-local slots with hash stagger and DST handling, `config/scheduler.yaml`
+  with per-market overrides, active-city discovery (`app.org_markets` ∪ demo markets), advisory-lock
+  lanes, shared Redfin backoff, late detector, queue drainer, `run-now`, dry-run `preview` with a
+  nightly-capacity check, clock-drift check, PII-scrubbed JSON logs, Sentry and Healthchecks hooks.
+- Windows: `scripts/install-services.ps1`, `uninstall-services.ps1`, `service.ps1`, `power.ps1`,
+  `backup-local.ps1`; service `aevoraex-scheduler` (NSSM, delayed auto-start, restart on exit) and
+  task `aevoraex-backup` (04:30, SYSTEM) installed. First backup: 198 MiB, verified, 69 s.
+- Additive publisher helpers: `push_freshness`, `mark_status`, `heartbeat` (14-day prune).
+- Miami (11458) and Tampa (18142) enabled; live checks: Miami 4,299 listings / 13 pages, Tampa 2,204 / 7.
+- Problems found live and fixed (details in `docs/decisions.md`): DOM drift re-queued ~every listing
+  daily (E2 amendment); `run_scrape` held a whole URL list in memory so a stop lost hours of fetching
+  (refresh now in 150-URL batches); a check job stayed busy while waiting on the refresh lane
+  (post-check refresh is its own job); the startup sweep failed the service's own ledger row;
+  an after-restart queue sat idle (queue drainer).
+- Early service restarts (first ~25 minutes of the soak) were deliberate fixes and show as
+  `CancelledError` refresh rows in the report.
+- Measured at concurrency 3: ~1.4 MB/page, 1.9 s/URL, ~0.53 URL/s. A full refresh of the five demo
+  cities (~10,700 listings) is ~5.6 h, longer than the 02:00-07:00 budget; ~7,300 first-time fetches
+  (Miami/Tampa/San Jose warming) drain over ~3.8 h. Proxy bandwidth is the open cost question.
+- Soak `e4-48h` started 2026-10-03 14:29 local (09:29Z); `logs/soak/e4-48h.json` holds the
+  publisher status *before* (Orlando and Vero Beach only, 1,642 properties, 86.8 MiB). Task
+  `aevoraex-soak-report-e4` runs `main.py scheduler soak-report --label e4-48h` at 2026-10-05
+  14:29 local and appends status before/after plus per-run metrics here. Not yet available.
+- Final verification: `ruff check .` passed; Mypy clean (strict on `aevorex.scheduler`);
+  Pytest all passing, including DST, stagger, late detector, backoff, lock, discovery, batching and
+  publisher-helper tests.

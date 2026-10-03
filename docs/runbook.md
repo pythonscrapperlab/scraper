@@ -125,3 +125,188 @@ redacted stubs per lens. A score mismatch is rejected and marks the run `partial
 The size guard warns at 350 MiB, refuses a new market at 420 MiB, and sends the
 configured failure heartbeat at 450 MiB. `prune` previews by default; use `--apply`
 only after reviewing the candidate count.
+
+## Scheduler service (E4)
+
+The `aevoraex-scheduler` Windows service runs `venv\Scripts\python.exe main.py scheduler run`
+from the repository root. It holds a single-instance lock, so a second copy refuses to start.
+Nothing calls the laptop; it pushes outbound only. **It never sends email.**
+
+### What it does
+
+| Trigger (market-local) | Chain |
+|---|---|
+| Check slots 07:00-21:00 every 120 min, plus 03:00 (+ hash stagger, 0-29 min) | search check -> push freshness; if anything was queued: detail refresh -> analyze -> full push |
+| Nightly refresh 02:00 (+ stagger) | whole-city detail refresh -> analyze -> full push |
+| 06:30 America/New_York `finalize` | wait for nightly refreshes, `market-stats` (if >20 h old), catch-up analyze, push if anything changed |
+| Every 5 min | discovery (new city -> `warming` check at once), late detector, queue drainer |
+| Every 10 min | heartbeat (Healthchecks + `serving.heartbeats`), retry failed pushes |
+| Every 60 min | clock-drift check |
+
+Active cities = enabled rows in `app.org_markets` plus `config/demo_markets.yaml`. Cadence,
+windows, stagger and per-market overrides live in `config/scheduler.yaml` (restart to apply).
+A city in `app.org_markets` with no Redfin region id in `scrapers/constants.py` cannot be
+scheduled; the service logs it at start-up and `scheduler preview` lists it.
+
+Limits: one check and one refresh at a time (they may overlap each other), one analyze, one
+publish. Redfin failures (incomplete search, failed or blocked refreshes) back off
+5 -> 10 -> 20 -> 40 -> 80 -> 120 min; a retry runs when the delay ends. A market that misses a
+check slot by 30 min is flagged `late` locally and on Supabase and gets one catch-up check.
+
+### First-time install
+
+Prerequisites: working `venv`, `.env` (see `.env.example`), local PostgreSQL service,
+`winget install NSSM.NSSM`. All commands are PowerShell, never WSL.
+
+```powershell
+python main.py scheduler preview --hours 48          # read the schedule and the capacity check
+.\scripts\install-services.ps1 -DryRun               # prints every change, makes none
+.\scripts\install-services.ps1 -Elevate -Start -ApplyPower   # one UAC prompt
+.\scripts\service.ps1 status
+```
+
+Install is idempotent: re-running updates the service in place. A transcript is written to
+`logs\install-services.log`. To remove it: `.\scripts\uninstall-services.ps1 -Elevate`
+(logs, backups, `.env` and the database are never touched).
+
+### Day-to-day
+
+```powershell
+.\scripts\service.ps1 status                          # no elevation needed
+.\scripts\service.ps1 restart -Elevate                # after a code or config change
+python main.py scheduler preview --hours 48           # dry run; add --offline to skip Supabase
+python main.py scheduler run-now --market orlando-fl --job check
+python main.py scheduler run-now --market orlando-fl --job nightly
+python main.py scheduler run-now --job market-stats
+python main.py scheduler clock-check
+python main.py publisher status
+```
+
+`run-now` uses the same locks as the service and fails fast ("lock_busy") when a lane is
+occupied; add `--wait` to queue behind it. It bypasses backoff and pause. Pause everything
+without uninstalling: set `SCHEDULER_PAUSED=true` in `.env` and restart (the service keeps
+heartbeating and discovering, and runs nothing).
+
+Logs: `logs\scheduler.jsonl` (JSON, daily rotation, 30 days, no PII; exception text is never
+written, only its class), `logs\service-stdout.log` / `service-stderr.log` (NSSM, size-rotated;
+only crashes before logging starts land here), `logs\backup.jsonl`.
+
+Ledger (metadata only, no listing data):
+
+```sql
+select kind, scope->>'city' as city, scope->>'trigger' as trigger, status,
+       round(duration_s::numeric) as seconds, counts, error_class, started_at
+from runs where started_at > now() at time zone 'utc' - interval '6 hours'
+order by started_at desc;
+```
+
+Kinds: `check`, `refresh`, `analyze`, `market_stats`, `publish`, `scheduler` (one row per service
+run). Waiting detail rows: `select market_slug, status, reason, count(*) from pending_refresh group by 1,2,3;`
+
+### Healthchecks and Sentry
+
+Everything is optional and silent when unset. In Healthchecks.io create:
+
+| Check | `.env` key | Period / grace | Meaning |
+|---|---|---|---|
+| scheduler heartbeat | `HEALTHCHECKS_SCHEDULER_URL` | 10 min / 15 min | the service is alive (sends `/fail` if the clock drifts >= 30 s) |
+| stage runs | `HEALTHCHECKS_RUNS_URL` | 1 day / 2 h | every stage pings `/start`, success or `/fail` with a run id and numeric counts; alert on `/fail` |
+| backup | `HEALTHCHECKS_BACKUP_URL` | 1 day / 2 h | nightly dump verified |
+| publisher | `HEALTHCHECKS_PUBLISHER_URL` | (existing) | push finished |
+
+Ping URLs are secrets: keep them in `.env` only. Sentry: set `SENTRY_DSN` (and optionally
+`SENTRY_ENVIRONMENT`). Events carry the job name, market slug and exception *class* only;
+messages, locals, breadcrumbs, request and user data are stripped before sending.
+
+### Clock drift
+
+Slots are wall-clock times, so a wrong clock shifts every run. The service compares against
+NTP (`time.windows.com`, then `pool.ntp.org`, then an HTTPS `Date` header) at start and hourly:
+warn >= 5 s, fail >= 30 s (error log, Sentry warning, failing heartbeat). Fix:
+
+```powershell
+w32tm /resync            # elevated; or Settings > Time & language > Sync now
+python main.py scheduler clock-check
+```
+
+### Power
+
+```powershell
+.\scripts\power.ps1                  # report only
+.\scripts\power.ps1 -Apply -Elevate  # AC: never sleep/hibernate, lid does nothing, no USB/PCIe/Wi-Fi power saving
+```
+
+Add `-DisableHibernate` (frees `hiberfil.sys` on C:) and `-ActiveHours` (Windows Update avoids
+06:00-00:00) if wanted. On this machine the lid-close setting is hidden by the OEM image; the
+script tries to unhide it when elevated. Keep the laptop plugged in and ventilated. A reboot
+costs freshness, never data: the service starts itself (delayed) after PostgreSQL and returns
+orphaned detail rows to the queue.
+
+### Backups, recovery, and the laptop-wipe case
+
+`scripts\backup-local.ps1` runs nightly at 04:30 as SYSTEM (task `aevoraex-backup`). It writes
+`D:\aevorex-backups\aevorex_db_YYYYMMDD_HHMMSS.dump` (custom format), verifies it with
+`pg_restore --list`, keeps the newest seven (`BACKUP_KEEP`), refuses to start without twice
+the last dump plus 1 GiB free, and logs `logs\backup.jsonl`. Manual run / dry run:
+
+```powershell
+.\scripts\backup-local.ps1 -DryRun
+.\scripts\backup-local.ps1
+```
+
+A scheduled task running as SYSTEM is invisible to a non-elevated `Get-ScheduledTask`; check it
+elevated, or look at `logs\backup.jsonl` and the dump timestamps.
+
+**These dumps live on the same machine.** They cover a bad migration or a dropped table, not a
+dead or stolen laptop. Supabase is *not* a backup: it holds only the capped serving subset and
+no POIs, raw payloads or history older than 30 days. Until an off-machine copy exists, copy the
+newest dump to cloud storage or an external drive weekly (set `BACKUP_DIR` to that drive to
+write there directly).
+
+Restore into the existing database (stop the service first):
+
+```powershell
+.\scripts\service.ps1 stop -Elevate
+$env:PGPASSWORD = '<db password>'   # type it; do not save it in a script
+& 'C:\Program Files\PostgreSQL\17\bin\pg_restore.exe' --clean --if-exists --no-owner -h localhost -U aevorex -d aevorex_db D:\aevorex-backups\<file>.dump
+Remove-Item Env:\PGPASSWORD
+python -m alembic current
+```
+
+Laptop-wipe recovery: install Windows, PostgreSQL 17 and Python 3.12; clone the repository; create
+the `venv` and install `requirements.txt`; restore `.env` from your password store (rotate the DB,
+proxy and Supabase credentials if the old disk may be exposed); create the `aevorex` role and
+`aevorex_db`, then `pg_restore` the newest dump; `python -m alembic upgrade head`;
+`python main.py publisher drift`; `python main.py publisher rebuild --all`;
+`winget install NSSM.NSSM`; `.\scripts\install-services.ps1 -Elevate -Start -ApplyPower`.
+Without any dump the local database cannot be rebuilt (only re-scraped), which is why the
+off-machine copy matters.
+
+### Disk
+
+`D:` was 87% full with 6.7 GiB free at E4. Each dump is about 200 MiB, so seven dumps cost about
+1.4 GiB. Check weekly: `Get-PSDrive D,C | Select Name,Free`. The raw-archive/POI-prune script
+`scripts\free-disk.ps1` from AGENTS.md section 9 is not part of E4 (see `docs/decisions.md`).
+
+### Failure playbook
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Market shows `late` on the web | missed slot (asleep, offline, service down) | `service.ps1 status`; the catch-up check runs by itself once the service is up |
+| Market shows `failed` | last check incomplete (block/405/network) | wait for the backoff retry (logged as "Redfin backoff"); if it repeats, check the proxy dashboard and rotate credentials |
+| `Another scheduler instance holds the service lock` | two services, or a stuck old process | `service.ps1 status`; stop the duplicate; the lock frees when its process exits |
+| `lock_busy` from `run-now` | a stage of that kind is running | wait, or use `--wait` |
+| Pushes failing, scraping fine | Supabase unreachable or size guard | heartbeat retries every 10 min; `python main.py publisher status` |
+| `nightly_overrun` in the log / Sentry | the active set cannot finish 02:00-07:00 | read `scheduler preview` capacity, add cities more slowly, or lengthen the window |
+| Clock drift `fail` | Windows time service stopped | `w32tm /resync`, then `scheduler clock-check` |
+| Many `ServiceInterrupted` runs | service killed (reboot, crash) | normal after a restart; the swept rows are history, not data loss |
+
+### 48-hour soak procedure
+
+```powershell
+python main.py scheduler soak-start --label e4-48h      # saves 'before' publisher status
+# ...leave the service running for 48 hours...
+python main.py scheduler soak-report --label e4-48h     # appends status before/after and per-run metrics to docs/progress.md
+```
+
+`soak-report --print-only` previews the Markdown without touching `docs/progress.md`.

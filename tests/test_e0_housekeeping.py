@@ -48,7 +48,7 @@ def test_run_counts_drop_strings_and_lists() -> None:
     [
         (["scrape", "--source", "redfin", "--state", "FL"], "scrape"),
         (["retry", "--source", "redfin", "--state", "FL"], "retry"),
-        (["scheduler"], "scheduler"),
+        (["scheduler", "run"], "scheduler"),
         (["market-stats"], "market-stats"),
         (["value"], "value"),
         (["score"], "score"),

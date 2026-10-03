@@ -81,11 +81,16 @@ python main.py scrape --source all --state FL
 python main.py retry --source zillow --state FL
 ```
 
-### Start Scheduler
+### Scheduler
 
-Runs periodic scrapes (if enabled in `.env`):
+The scheduler is a Windows service (`aevoraex-scheduler`, installed with NSSM). It drives
+per-city freshness checks, nightly refreshes, analysis and Supabase publishing. Operator
+commands (see `docs/runbook.md`):
 ```bash
-python main.py scheduler
+python main.py scheduler preview --hours 48     # dry run: what would fire, and does it fit?
+python main.py scheduler run-now --market orlando-fl --job check
+python main.py scheduler clock-check
+python main.py scheduler run                    # the service entry point (NSSM runs this)
 ```
 
 ## Project Structure
@@ -115,7 +120,9 @@ aevorex/
 ├── pipeline/
 │   └── runner.py          # Orchestration + dedup
 ├── scheduler/
-│   └── jobs.py            # APScheduler jobs
+│   ├── service.py         # APScheduler service (aevoraex-scheduler)
+│   ├── jobs.py            # check -> refresh -> analyze -> publish chain
+│   └── slots.py           # market-local slots shared by service and preview
 ├── config.py              # Settings from .env
 ├── main.py                # Click CLI entry point
 └── __init__.py
@@ -191,7 +198,8 @@ Key settings in `.env`:
 - `PROXY_*` — Proxy settings (disabled by default)
 - `ZILLOW_ENABLED`, `REDFIN_ENABLED`, `REALTOR_ENABLED` — Enable/disable scrapers
 - `TARGET_STATES` — FL, CA (comma-separated)
-- `SCHEDULER_*` — Scheduler intervals
+- `SCHEDULER_PAUSED`, `SCHEDULER_CONFIG_PATH` — Scheduler kill switch and `config/scheduler.yaml` (cadence, windows, stagger, per-market overrides)
+- `SENTRY_DSN`, `HEALTHCHECKS_*`, `BACKUP_DIR`, `BACKUP_KEEP` — optional observability and backups
 
 ## Conventions
 

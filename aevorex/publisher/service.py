@@ -85,14 +85,18 @@ class Publisher:
             remote_engine or publisher_engine(), batch_size=settings.publisher_batch_size
         )
         self._fixed_now = now
+        self._cadence_minutes = 120
 
     @property
     def now(self) -> datetime:
         """Current UTC time, optionally fixed for deterministic tests."""
         return self._fixed_now or datetime.now(UTC)
 
-    async def push(self, market_slug: str, *, trigger: str = "cli") -> PublishResult:
+    async def push(
+        self, market_slug: str, *, trigger: str = "cli", cadence_minutes: int = 120
+    ) -> PublishResult:
         """Publish one market in ordered transactions; freshness commits last."""
+        self._cadence_minutes = cadence_minutes
         definition = market_definition(market_slug)
         await self.store.initialize()
         run_id = uuid4()
@@ -323,6 +327,79 @@ class Publisher:
         await self._ping_healthcheck(failed=False)
         return {"heartbeats": 1}
 
+    async def push_freshness(self, market_slug: str) -> bool:
+        """Update only the freshness columns of an already-published market.
+
+        Used after a check that changed nothing: the web must still see the new
+        ``last_checked_at`` without paying for a full-city push. Returns ``False`` when the
+        market has never been published (the caller must then run a full push).
+        """
+        definition = market_definition(market_slug)
+        await self._ensure_initialized()
+        async with self.local_sessions() as session:
+            freshness = await session.get(MarketFreshness, definition.slug)
+        if freshness is None:
+            return False
+        values = {
+            "last_checked_at": _aware(freshness.last_checked_at),
+            "next_check_at": _aware(freshness.next_check_at),
+            "last_refreshed_at": _aware(freshness.last_refreshed_at),
+            "check_status": freshness.check_status,
+            "listings_active": freshness.listings_active,
+            "changed_last_check": freshness.changed_last_check,
+            "source_status": {"redfin": freshness.check_status},
+            "updated_at": self.now,
+        }
+        return await self._update_market(definition.slug, values, note="freshness")
+
+    async def mark_status(
+        self,
+        market_slug: str,
+        check_status: str,
+        *,
+        next_check_at: datetime | None = None,
+    ) -> bool:
+        """Set ``late``/``failed``/``warming``/``ok`` without touching freshness times."""
+        if check_status not in {"ok", "late", "failed", "warming"}:
+            raise ValueError("Unsupported check_status")
+        await self._ensure_initialized()
+        values: dict[str, Any] = {
+            "check_status": check_status,
+            "source_status": {"redfin": check_status},
+            "updated_at": self.now,
+        }
+        if next_check_at is not None:
+            values["next_check_at"] = _aware(next_check_at)
+        return await self._update_market(market_slug, values, note=f"status:{check_status}")
+
+    async def heartbeat(self, note: str = "scheduler") -> None:
+        """Insert one heartbeat row. Unlike ``wake`` it pings no Healthchecks URL."""
+        await self._ensure_initialized()
+        beats = self.store.table("heartbeats")
+        async with self.store.transaction() as remote:
+            await remote.execute(beats.insert().values(at=self.now, note=note[:80]))
+            # One row per 10 minutes would grow without bound on a 500 MB plan: keep 14 days.
+            await remote.execute(delete(beats).where(beats.c.at < self.now - timedelta(days=14)))
+
+    async def _ensure_initialized(self) -> None:
+        if not self.store.tables:
+            await self.store.initialize()
+
+    async def _update_market(self, slug: str, values: dict[str, Any], *, note: str) -> bool:
+        markets = self.store.table("markets")
+        async with self.store.transaction() as remote:
+            result = await remote.execute(
+                update(markets).where(markets.c.slug == slug).values(**values)
+            )
+            if not result.rowcount:
+                return False
+            await remote.execute(
+                self.store.table("heartbeats").insert().values(
+                    at=self.now, note=f"publisher:{slug}:{note}"[:80]
+                )
+            )
+        return True
+
     async def close(self) -> None:
         await self.store.close()
 
@@ -372,7 +449,7 @@ class Publisher:
             "zips": sorted({item.zip_code for item in properties if item.zip_code}),
             "active": True,
             "is_demo": definition.is_demo,
-            "check_cadence_minutes": 120,
+            "check_cadence_minutes": self._cadence_minutes,
             "updated_at": self.now,
         }
 

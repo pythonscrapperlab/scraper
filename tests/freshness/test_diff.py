@@ -60,7 +60,17 @@ def _previous(**changes: object) -> PreviousListing:
             ["relisted"],
             "relisted",
         ),
-        (_current(dom=11), _previous(), [], "search_metadata"),
+        (_current(dom=11), _previous(), [], None),  # aging alone is not a change
+        (_current(dom=40), _previous(dom=10), [], None),
+        (_current(dom=3), _previous(dom=10), [], "search_metadata"),  # DOM reset / relist
+        (_current(dom=None), _previous(dom=10), [], "search_metadata"),
+        (_current(dom=10), _previous(dom=None), [], "search_metadata"),
+        (
+            _current(dom=11, listed_at=NOW + timedelta(days=3)),
+            _previous(),
+            [],
+            "search_metadata",
+        ),
         (
             _current(listed_at=NOW + timedelta(seconds=20)),
             _previous(),
