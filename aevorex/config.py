@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     supabase_project_url: str | None = None
     supabase_publishable_key: SecretStr | None = None
     supabase_direct_connection_url: SecretStr | None = None
+    healthchecks_publisher_url: SecretStr | None = None
+    publisher_batch_size: int = 2000
 
     # === Scraping: Zillow ===
     zillow_enabled: bool = True

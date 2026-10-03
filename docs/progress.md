@@ -78,3 +78,22 @@ Status: implemented and verified locally; no Supabase writes and no email delive
 - Final verification: `ruff check .` passed; Mypy reported no issues across 65 source
   files; Pytest passed 294/294 tests, including clean migration replay, frozen-score
   regression coverage, database-backed idempotency, and the two-absence rule.
+
+## 2026-10-03 â€” E3 publisher
+
+Status: implemented; live push and final verification are recorded in the handoff.
+
+- Created `feat/e3-publisher` from the merged E2 baseline.
+- Added strict-typed serving-v2 publishing with bounded upserts, exact child
+  replacement, score recomposition gating, previous-score preservation, timezone and
+  ZIP derivation, size guard, heartbeat, and freshness-last completion.
+- Added exact three-full/five-stub public demo snapshots and redaction coverage.
+- Added `push`, `status`, `rebuild`, `prune`, `drift`, and `wake`; no alert,
+  morning-brief, scheduler, or email-delivery path was added.
+- Added focused tests for idempotency, prune boundaries, redaction, size thresholds,
+  and partial status after recomposition rejection.
+- Live idempotent pushes completed in 42.52 s for Orlando (1,196 properties, 5,841
+  scores) and 26.20 s for Vero Beach (446 properties, 1,819 scores), with zero
+  recomposition rejections. Remote database size after both markets was 88.09 MiB.
+- Final verification: `ruff check .` passed; Mypy reported no issues across 71 source
+  files; Pytest passed 305/305 tests, including 11 focused publisher tests.

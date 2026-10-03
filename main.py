@@ -13,6 +13,7 @@ Commands:
 """
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypeVar
@@ -39,6 +40,139 @@ logger = logging.getLogger(__name__)
 def cli():
     """Aevorex scraper CLI."""
     pass
+
+
+@cli.group("publisher")
+def publisher_group() -> None:
+    """Push the local source of truth to the Supabase serving cache."""
+
+
+@publisher_group.command("push")
+@click.option("--market", "market_slug", required=True, help="Market slug")
+def publisher_push(market_slug: str) -> None:
+    """Publish one market in serving-v2 transaction groups."""
+    _run_command(
+        "publisher_push",
+        {"city": market_slug},
+        lambda: _publisher_push(market_slug),
+    )
+
+
+@publisher_group.command("status")
+def publisher_status() -> None:
+    """Show schema, freshness, database size, and per-table row counts."""
+    _run_command("publisher_status", {}, _publisher_status)
+
+
+@publisher_group.command("rebuild")
+@click.option("--market", "market_slug", default=None, help="One market slug")
+@click.option("--all", "all_markets", is_flag=True, help="All configured Redfin markets")
+def publisher_rebuild(market_slug: str | None, all_markets: bool) -> None:
+    """Recreate one or all configured markets from local truth."""
+    if bool(market_slug) == all_markets:
+        raise click.UsageError("Choose exactly one of --market or --all")
+    _run_command(
+        "publisher_rebuild",
+        {"city": market_slug, "all_markets": all_markets},
+        lambda: _publisher_rebuild(market_slug, all_markets),
+    )
+
+
+@publisher_group.command("prune")
+@click.option("--market", "market_slug", required=True, help="Market slug")
+@click.option("--dry-run/--apply", default=True, help="Preview by default")
+def publisher_prune(market_slug: str, dry_run: bool) -> None:
+    """Preview or apply exact serving-retention pruning."""
+    _run_command(
+        "publisher_prune",
+        {"city": market_slug, "dry_run": dry_run},
+        lambda: _publisher_prune(market_slug, dry_run),
+    )
+
+
+@publisher_group.command("drift")
+def publisher_drift() -> None:
+    """Compare the linked serving schema with serving v2."""
+    _run_command("publisher_drift", {}, _publisher_drift)
+
+
+@publisher_group.command("wake")
+def publisher_wake() -> None:
+    """Write a publisher readiness heartbeat without scheduling work."""
+    _run_command("publisher_wake", {}, _publisher_wake)
+
+
+async def _with_publisher(method: str, *args: object, **kwargs: object) -> Any:
+    from aevorex.publisher import Publisher
+
+    publisher = Publisher()
+    try:
+        return await getattr(publisher, method)(*args, **kwargs)
+    finally:
+        await publisher.close()
+
+
+async def _publisher_push(market_slug: str) -> dict[str, int | float | bool]:
+    result = await _with_publisher("push", market_slug)
+    telemetry = result.telemetry()
+    click.echo(json.dumps({"market": result.market, "status": result.status, **telemetry}, sort_keys=True))
+    return telemetry
+
+
+async def _publisher_status() -> dict[str, int]:
+    status = await _with_publisher("status")
+    click.echo(json.dumps(status, indent=2, default=str, sort_keys=True))
+    return {"tables": len(status["table_counts"]), "markets": len(status["markets"])}
+
+
+async def _publisher_rebuild(
+    market_slug: str | None, _all_markets: bool
+) -> dict[str, int]:
+    from sqlalchemy import select
+
+    from aevorex.db.models import MarketFreshness
+    from aevorex.publisher import Publisher
+
+    if market_slug:
+        slugs = [market_slug]
+    else:
+        async with async_session_maker() as session:
+            slugs = list(
+                (await session.execute(select(MarketFreshness.slug).order_by(MarketFreshness.slug)))
+                .scalars()
+                .all()
+            )
+    publisher = Publisher()
+    rebuilt = 0
+    partial = 0
+    try:
+        for slug in slugs:
+            if slug is None:
+                continue
+            result = await publisher.rebuild(slug)
+            rebuilt += 1
+            partial += result.status == "partial"
+    finally:
+        await publisher.close()
+    return {"rebuilt": rebuilt, "partial": partial}
+
+
+async def _publisher_prune(market_slug: str, dry_run: bool) -> dict[str, int]:
+    result = await _with_publisher("prune", market_slug, dry_run=dry_run)
+    click.echo(json.dumps(result, sort_keys=True))
+    return result
+
+
+async def _publisher_drift() -> dict[str, int | bool]:
+    result = await _with_publisher("drift")
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    return {"ok": bool(result["ok"]), "column_drift": len(result["column_drift"])}
+
+
+async def _publisher_wake() -> dict[str, int]:
+    result = await _with_publisher("wake")
+    click.echo(json.dumps(result, sort_keys=True))
+    return result
 
 
 @cli.command("check")

@@ -111,3 +111,19 @@
 - **Incremental analysis does not rebuild baselines.** `analyze --changed` values and
   scores `needs_analysis` rows, then records tier transitions. The same API supports an
   explicit nightly market-stat rebuild for the future scheduler milestone.
+
+## 2026-10-03 â€” E3 publisher
+
+- **Search membership is authoritative.** A property enters a market cache only when
+  `listing_presence` links its market/Redfin ID to a canonical local property.
+- **Freshness commits last.** Identity, properties, validated scores, children,
+  events, snapshots, and daily rollup commit before market freshness and the heartbeat.
+- **Previous scores move only on change.** Idempotent republishes preserve `prev_*`;
+  a changed value shifts the formerly published score/percentile into those columns.
+- **Child collections are exact replacements.** Images are deterministically capped
+  at 12; dependent facts are rebuilt so removed local data cannot linger remotely.
+- **Public snapshots are allowlisted.** Each lens contains three addressed full rows
+  with two component labels and five anonymous tier/price-band/DOM stubs.
+- **The size guard uses binary MiB.** Warn at 350, stop new cities at 420, page at 450.
+- **Wake is readiness-only.** It writes a heartbeat and optional Healthchecks ping;
+  it schedules no work and never invokes the E5 email queue.
