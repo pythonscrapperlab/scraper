@@ -275,3 +275,28 @@
   row if re-run, and never back-fills a day it did not observe. The first row's trailing 24 h
   includes the E4 service restarts of 2026-10-03.
 
+
+## E6 - stabilise and slim (branch `fix/e6-stabilise-slim`, 2026-10-04)
+
+Audit 2026-10-03 found correctness bugs and a publisher that sent far more than the web renders. Fixed in nine steps, one commit each.
+
+### Step 1 - valuation v2 restore
+
+- **The `backup/stash*` branches do not exist**; the work lives only in `stash@{0..2}`. Restored from `stash@{0}` (dated 2026-09-30) directly. `tests/valuation/test_v3_valuation.py` was in stash 0's untracked part (`stash@{0}^3`), not stash 2. All stashes are left in place.
+- Restored `valuation/{engine,rehab,rent,comps}.py` (rehab, rent, comps locality filter, ARV exit cap, uncorroborated shrink) and `VALUATION_VERSION = "v2"`. Re-applied the E0 logging rule: class-only logging, no `exc_info=True`. No scorer was touched.
+- Why it regressed: `main` still carried the v1 valuation files, so since E5 the service has written `v1` rows (1,397 at 2026-10-04, all one 2026-10-03 10:30 batch) next to 9,926 `v2` rows (all computed 2026-09-19 22:15-22:26). Those v1 rows were **not** re-valued: re-valuing changes their scores, which is an owner call. They are reported by the soak.
+- Reproduction proof (`scripts/prove_valuation_v2.py`, read-only, rolls back, output in `docs/valuation-v2-repro.md`): of 200 stored-v2 rows, **158 reproduce market_value, arv, rehab_mid, rent within 1% with identical flags; 42 differ.**
+  - 8 differ because the property row and comps changed after 2026-09-19.
+  - 34 have no per-property input change. 19 are rent-only, driven by the market-wide zip x bedroom rent index (median of rental `price_history`, 24-month rolling window, +2,784 properties since). Replaying the index as of the stored run time removes 7 of them. The other 15 no-change rows are market-baseline drift (`market_stats` is recomputed nightly with no history, so it cannot be replayed) or code evolution.
+  - **Limit of the proof:** stash 0 post-dates the stored run by 11 days of uncommitted work. Code drift between those two points cannot be ruled out and cannot be recovered. The honest statement is: the restored code reproduces 79% exactly on today's data and explains the rest by documented data drift, not proof of byte-identity.
+
+### Follow-ups logged (out of scope for E6)
+
+- Mid-term lens seasonal cap (product decision pending).
+- The two MAO formulas (valuation `max_allowable_offer` vs the fix-flip scorer's).
+- Dead config fields.
+- Percentile pools that include delisted rows.
+- Scheduler backoff / `publish_debt` persistence across restarts.
+- Ingestion parser bugs.
+- Stale README / CLAUDE.md.
+- Backfill of the 1,397 `v1` valuation rows (changes their scores).

@@ -41,6 +41,11 @@ MAX_RENT = 30_000
 
 MIN_CELL_OBSERVATIONS = 3
 
+# Size adjustment of the zip x bedroom median rent (see estimate_rent).
+SIZE_ELASTICITY = 0.6
+SIZE_ADJUST_MIN = 0.6
+SIZE_ADJUST_MAX = 1.5
+
 METHOD_CONFIDENCE = {
     "source_avm": 0.90,
     "zip_bed_model": 0.60,
@@ -75,7 +80,8 @@ async def build_zip_bed_rent_index(session: AsyncSession) -> Dict[tuple, tuple]:
     rows = (await session.execute(text("""
         SELECT p.zip_code, p.bedrooms,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY ph.price) AS median_rent,
-               count(*) AS n
+               count(*) AS n,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY p.sqft) FILTER (WHERE p.sqft > 0) AS median_sqft
         FROM price_history ph
         JOIN properties p ON p.id = ph.property_id
         WHERE ph.is_rental_event
@@ -90,7 +96,10 @@ async def build_zip_bed_rent_index(session: AsyncSession) -> Dict[tuple, tuple]:
     })).mappings().all()
 
     index = {
-        (row["zip_code"], int(row["bedrooms"])): (float(row["median_rent"]), int(row["n"]))
+        (row["zip_code"], int(row["bedrooms"])): (
+            float(row["median_rent"]), int(row["n"]),
+            float(row["median_sqft"]) if row["median_sqft"] else None,
+        )
         for row in rows
     }
     logger.info("Built zip x bedroom rent index: %d cells.", len(index))
@@ -106,6 +115,7 @@ def estimate_rent(
     market: Optional[dict],
     rent_index: Optional[Dict[tuple, tuple]] = None,
     property_type: Optional[str] = None,
+    sqft: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Best available monthly rent, plus the method and confidence behind it.
@@ -123,11 +133,31 @@ def estimate_rent(
             "flags": flags,
         }
 
+    # Multi-family rents are per unit, and the source never publishes them
+    # (1.1% coverage). A zip x bedroom median would hand a 1956 duplex the
+    # rent of a luxury 4-bed condo tower in the same zip, so the modelled
+    # methods are skipped rather than allowed to invent one.
+    type_text = (property_type or "").lower()
+    if "multi" in type_text:
+        flags.append("multi_family_rent_not_available_excluded_from_income_scoring")
+        return {"monthly": None, "method": None, "confidence": 0.0, "flags": flags}
+
     # ---- 2. observed rents for this zip and bedroom count ----
     if rent_index and zip_code and bedrooms is not None:
         cell = rent_index.get((zip_code, int(bedrooms)))
         if cell:
-            median_rent, n = cell
+            median_rent, n = cell[0], cell[1]
+            median_sqft = cell[2] if len(cell) > 2 else None
+            # Size adjustment. The cell median is for a typical unit with
+            # this bedroom count; a 470 sqft 1925 studio in Miami Beach was
+            # inheriting the median of luxury one-beds twice its size. Rent
+            # scales sub-linearly with area, and the factor is clamped so a
+            # thin cell cannot produce an absurd extrapolation.
+            if sqft and median_sqft and median_sqft > 0:
+                ratio = max(SIZE_ADJUST_MIN, min(SIZE_ADJUST_MAX, sqft / median_sqft))
+                median_rent = median_rent * (ratio ** SIZE_ELASTICITY)
+                if ratio != 1.0:
+                    flags.append("rent_size_adjusted_from_zip_bedroom_median")
             # Confidence scales with the cell's sample; a 3-observation cell
             # is real evidence but not the same as a 60-observation one.
             confidence = METHOD_CONFIDENCE["zip_bed_model"] * min(1.0, n / 20.0)
@@ -157,13 +187,6 @@ def estimate_rent(
                     "flags": flags,
                 }
 
-    # Multi-family is the systematic gap: 1.1% source coverage, and rents are
-    # per-unit rather than per-property so a whole-building figure would be
-    # meaningless anyway. Say so rather than inventing one.
-    type_text = (property_type or "").lower()
-    if "multi" in type_text:
-        flags.append("multi_family_rent_not_available_excluded_from_income_scoring")
-    else:
-        flags.append("no_rent_estimate_available")
+    flags.append("no_rent_estimate_available")
 
     return {"monthly": None, "method": None, "confidence": 0.0, "flags": flags}
