@@ -4,6 +4,9 @@ CLI entry point for Aevorex scraper.
 Commands:
 - scrape --source [platform] --state [state]
 - retry --source [platform] --state [state]
+- check --city [market-slug]
+- refresh --city [market-slug] | --pending
+- analyze --changed
 - analyze            (market-stats -> value -> score, in the only order that works)
 - market-stats / value / score   (the individual stages)
 - scheduler
@@ -36,6 +39,36 @@ logger = logging.getLogger(__name__)
 def cli():
     """Aevorex scraper CLI."""
     pass
+
+
+@cli.command("check")
+@click.option("--city", "market_slug", required=True, help="Market slug, e.g. orlando-fl")
+def check_market(market_slug: str) -> None:
+    """Run one complete Redfin search-results-only market check."""
+    from aevorex.freshness.check import run_check
+
+    logger.info("Starting search-level check: market=%s", market_slug)
+    _run_command("check", {"city": market_slug}, lambda: run_check(market_slug))
+
+
+@cli.command("refresh")
+@click.option("--city", "market_slug", default=None, help="Refresh all active city listings")
+@click.option("--pending", "pending_only", is_flag=True, help="Consume due queued listings")
+def refresh_market(market_slug: str | None, pending_only: bool) -> None:
+    """Refresh Redfin property details with concurrency three."""
+    from aevorex.freshness.refresh import run_refresh
+
+    if (market_slug is None) == (not pending_only):
+        raise click.UsageError("Choose exactly one of --city or --pending")
+    scope: dict[str, JsonValue] = {
+        "city": market_slug,
+        "pending": pending_only,
+    }
+    _run_command(
+        "refresh",
+        scope,
+        lambda: run_refresh(market_slug=market_slug, pending_only=pending_only),
+    )
 
 
 @cli.command()
@@ -305,7 +338,9 @@ async def _score_all(all_properties: bool = False) -> dict:
               help="Reprocess every property, not just those flagged needs_analysis.")
 @click.option("--skip-market-stats", is_flag=True,
               help="Reuse the existing baselines instead of rebuilding them.")
-def analyze(all_properties: bool, skip_market_stats: bool):
+@click.option("--changed", is_flag=True,
+              help="Run E2 value + score for needs_analysis rows and record tier moves.")
+def analyze(all_properties: bool, skip_market_stats: bool, changed: bool):
     """
     Run the full analysis chain: market-stats -> value -> score.
 
@@ -325,15 +360,27 @@ def analyze(all_properties: bool, skip_market_stats: bool):
     leaves the valuation stage with nothing to do and no way to notice. Here
     the flag is read by valuation and only then consumed by scoring.
     """
-    logger.info("Starting full analysis chain...")
+    if changed and all_properties:
+        raise click.UsageError("--changed and --all are mutually exclusive")
+    logger.info("Starting analysis chain...")
     _run_command(
         "analyze",
         {
             "all_properties": all_properties,
             "skip_market_stats": skip_market_stats,
+            "changed": changed,
         },
-        lambda: _analyze_all(all_properties, skip_market_stats),
+        lambda: _analyze_changed() if changed else _analyze_all(
+            all_properties, skip_market_stats
+        ),
     )
+
+
+async def _analyze_changed() -> dict[str, object]:
+    """Run the E2 incremental analysis stage without rebuilding nightly baselines."""
+    from aevorex.freshness.analyze import run_changed_analysis
+
+    return await run_changed_analysis(nightly=False)
 
 
 async def _analyze_all(all_properties: bool = False,

@@ -79,6 +79,8 @@ backups/
 docs/*
 !docs/breakdown/
 !docs/breakdown/*.md
+!docs/decisions.md
+!docs/progress.md
 *output
 old.env
 raw.ipynb

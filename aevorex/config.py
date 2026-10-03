@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     scraper_timeout: int = 30  # seconds
     scraper_retries: int = 3
     scraper_retry_delay: int = 5  # seconds
-    scraper_concurrent_urls: int = 1  # Sequential for now to avoid detection
+    scraper_concurrent_urls: int = 3  # Conservative detail-page concurrency
 
     # === Transport: Playwright ===
     playwright_headless: bool = True

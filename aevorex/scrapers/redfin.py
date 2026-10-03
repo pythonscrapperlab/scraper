@@ -4,10 +4,12 @@ import asyncio
 import json
 import math
 import re
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from bs4 import BeautifulSoup
+from httpx import HTTPStatusError
 
 from aevorex.config import settings
 from aevorex.scrapers.base import BaseScraper
@@ -43,6 +45,7 @@ class RedfinScraper(BaseScraper):
                 self.proxy_manager.enabled = True
 
         self.base_filters = "/filter/sort=lo-days,min-price=50k,property-type=house+condo+townhouse+multifamily,max-days-on-market=4mo,include=forsale+mlsfsbo+fsbo,exclude-age-restricted,exclude-land-lease/page-[PAGE]"
+        self.fetch_metrics: Counter[str] = Counter()
 
     def _new_client(self) -> HttpClient:
         """Create an HttpClient bound to webshare's rotating gateway (or no proxy)."""
@@ -210,19 +213,28 @@ class RedfinScraper(BaseScraper):
         for i in range(3):
             client = self._new_client()
             try:
+                self.fetch_metrics["attempts"] += 1
                 # Property page — return HTML
                 self.logger.debug("Fetching Redfin property page")
                 response = await client.get_text(url, headers=headers)
                 return response # type: ignore
             except Exception as e:
+                self.fetch_metrics["failures"] += 1
+                if isinstance(e, HTTPStatusError):
+                    status_code = e.response.status_code
+                    if status_code == 405:
+                        self.fetch_metrics["http_405"] += 1
+                    if status_code in {403, 405, 429}:
+                        self.fetch_metrics["blocked"] += 1
                 self.logger.warning(
                     "Property fetch failed: attempt=%s error_class=%s",
                     i + 1,
                     type(e).__name__,
                 )
                 await asyncio.sleep(2)  # Wait before retrying
+            finally:
+                await client.close()
         self.logger.error("Property fetch exhausted retries")
-        await client.close()
         return None
 
     async def parse(self, raw: str) -> Optional[Dict[str, Any]]:
