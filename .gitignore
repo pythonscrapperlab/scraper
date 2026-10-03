@@ -81,6 +81,7 @@ docs/*
 !docs/breakdown/*.md
 !docs/decisions.md
 !docs/progress.md
+!docs/runbook.md
 *output
 old.env
 raw.ipynb
