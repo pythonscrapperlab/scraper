@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aevorex.config import settings
 from aevorex.db.models import (
     ChangeEvent,
     ListingPresence,
@@ -77,13 +78,74 @@ async def run_refresh(
         RedfinNormalizer(),  # type: ignore[no-untyped-call]
         max_concurrent_fetches=3,
     )
-    urls = [str(item.listing_url) for item in items]
     state = resolve_market(market_slug).state if market_slug else ""
-    async with async_session_maker() as session:
-        pipeline_result = await runner.run_scrape(session, state, urls=urls)
 
-    redfin_ids = {str(item.redfin_id) for item in items}
-    queue_ids = {item.id for item in items}
+    # PipelineRunner fetches and parses a whole URL list in memory before it writes anything.
+    # Handing it thousands of URLs at once means no durable progress for an hour and a lost
+    # run (and wasted proxy bandwidth) on any restart or cancel. Work in bounded batches:
+    # each one is written and its queue rows settled before the next begins.
+    batch_size = max(1, settings.refresh_batch_size)
+    success = 0
+    failed = 0
+    pipeline_errors = 0
+    for offset in range(0, len(items), batch_size):
+        batch = list(items[offset : offset + batch_size])
+        async with async_session_maker() as session:
+            pipeline_result = await runner.run_scrape(
+                session, state, urls=[str(item.listing_url) for item in batch]
+            )
+        pipeline_errors += int(pipeline_result["stats"]["errors"])
+        batch_success, batch_failed = await _settle_batch(batch, started_at)
+        success += batch_success
+        failed += batch_failed
+        logger.info(
+            "Detail refresh batch: done=%s/%s success=%s failed=%s",
+            min(offset + batch_size, len(items)),
+            len(items),
+            success,
+            failed,
+        )
+
+    if market_slug is not None and failed == 0:
+        async with async_session_maker() as session:
+            market_row = await session.get(MarketFreshness, market_slug)
+            if market_row is not None:
+                mutable_market: Any = market_row
+                mutable_market.last_refreshed_at = utc_now()
+                await session.commit()
+
+    attempts = int(scraper.fetch_metrics["attempts"])
+    blocks = int(scraper.fetch_metrics["blocked"])
+    counts: dict[str, int | float] = {
+        "queued": len(items),
+        "success": success,
+        "failed": failed,
+        "attempts": attempts,
+        "http_405": int(scraper.fetch_metrics["http_405"]),
+        "blocked": blocks,
+        "block_rate": round(blocks / attempts, 4) if attempts else 0.0,
+        "pipeline_errors": pipeline_errors,
+    }
+    logger.info(
+        "Detail refresh complete: queued=%s success=%s failed=%s attempts=%s "
+        "http_405=%s blocked=%s block_rate=%.4f",
+        counts["queued"],
+        counts["success"],
+        counts["failed"],
+        counts["attempts"],
+        counts["http_405"],
+        counts["blocked"],
+        counts["block_rate"],
+    )
+    return counts
+
+
+async def _settle_batch(batch: list[PendingRefresh], started_at: datetime) -> tuple[int, int]:
+    """Mark one finished batch's queue rows succeeded/failed from what the pipeline wrote."""
+    redfin_ids = {str(item.redfin_id) for item in batch}
+    queue_ids = {item.id for item in batch}
+    success = 0
+    failed = 0
     async with async_session_maker() as session:
         refreshed = (
             await session.execute(
@@ -104,8 +166,6 @@ async def run_refresh(
                 )
             )
         ).scalars().all()
-        success = 0
-        failed = 0
         for item in queue_items:
             mutable_item: Any = item
             prop = refreshed_by_id.get(str(item.redfin_id))
@@ -125,38 +185,8 @@ async def run_refresh(
                     minutes=backoff_delay_minutes(int(mutable_item.attempts))
                 )
                 failed += 1
-
-        if market_slug is not None and failed == 0:
-            market_row = await session.get(MarketFreshness, market_slug)
-            if market_row is not None:
-                mutable_market: Any = market_row
-                mutable_market.last_refreshed_at = utc_now()
         await session.commit()
-
-    attempts = int(scraper.fetch_metrics["attempts"])
-    blocks = int(scraper.fetch_metrics["blocked"])
-    counts: dict[str, int | float] = {
-        "queued": len(items),
-        "success": success,
-        "failed": failed,
-        "attempts": attempts,
-        "http_405": int(scraper.fetch_metrics["http_405"]),
-        "blocked": blocks,
-        "block_rate": round(blocks / attempts, 4) if attempts else 0.0,
-        "pipeline_errors": int(pipeline_result["stats"]["errors"]),
-    }
-    logger.info(
-        "Detail refresh complete: queued=%s success=%s failed=%s attempts=%s "
-        "http_405=%s blocked=%s block_rate=%.4f",
-        counts["queued"],
-        counts["success"],
-        counts["failed"],
-        counts["attempts"],
-        counts["http_405"],
-        counts["blocked"],
-        counts["block_rate"],
-    )
-    return counts
+    return success, failed
 
 
 async def _queue_city(market_slug: str, city: str, state: str) -> None:

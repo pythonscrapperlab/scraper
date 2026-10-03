@@ -19,6 +19,7 @@ PyYAML
 redis
 requests
 selenium
+sentry-sdk
 sqlalchemy[asyncio]
 tenacity
 uvicorn[standard]

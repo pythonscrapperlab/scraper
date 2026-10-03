@@ -98,7 +98,16 @@ def diff_listing(
             and abs(current.listed_at - previous.listed_at) > timedelta(minutes=5)
         )
     )
-    if current.dom != previous.dom or listed_at_changed:
+    # Days-on-market ticks up by itself every day, so a larger value with an unchanged listing
+    # date is aging, not a change. Treating it as one re-queued ~every listing on the first
+    # check of each day (the E4 soak measured 2,243 of Orlando's 2,565) and doubled the
+    # nightly refresh. Only a DOM that appeared/vanished or went *down* (a relist/reset)
+    # signals something new, alongside a moved listing date.
+    dom_presence_changed = (current.dom is None) != (previous.dom is None)
+    dom_went_down = (
+        current.dom is not None and previous.dom is not None and current.dom < previous.dom
+    )
+    if listed_at_changed or dom_presence_changed or dom_went_down:
         enqueue_reason = enqueue_reason or "search_metadata"
 
     return ListingDecision(current, previous.property_id, tuple(events), enqueue_reason)

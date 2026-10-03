@@ -34,6 +34,7 @@ module = [
   "aevorex.run_tracking",
   "aevorex.freshness.*",
   "aevorex.publisher.*",
+  "aevorex.scheduler.*",
 ]
 strict = true
 ignore_errors = false

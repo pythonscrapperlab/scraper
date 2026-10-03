@@ -1,1 +1,1 @@
-"""Job scheduler for periodic scraping."""
+"""Windows scheduler service: drives freshness checks, refreshes, analysis and publishing."""

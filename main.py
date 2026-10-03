@@ -9,12 +9,13 @@ Commands:
 - analyze --changed
 - analyze            (market-stats -> value -> score, in the only order that works)
 - market-stats / value / score   (the individual stages)
-- scheduler
+- scheduler run | preview | run-now | clock-check | soak-start | soak-report
 """
 
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypeVar
 
@@ -360,21 +361,220 @@ async def _retry_single(source: str, state: str) -> dict[str, int]:
         }
 
 
-@cli.command()
-def scheduler():
-    """Start the APScheduler job scheduler."""
-    logger.info("Starting APScheduler...")
-    _run_command("scheduler", {}, _start_scheduler)
+@cli.group("scheduler")
+def scheduler_group() -> None:
+    """Windows scheduler service and its operator tools."""
+
+
+@scheduler_group.command("run")
+def scheduler_run() -> None:
+    """Run the scheduler service in the foreground (NSSM runs exactly this)."""
+    logger.info("Starting scheduler service...")
+    _run_command("scheduler", {"pid": os.getpid()}, _start_scheduler)
 
 
 async def _start_scheduler() -> dict[str, int]:
-    if not settings.scheduler_enabled:
-        raise RuntimeError("SchedulerDisabled")
+    from aevorex.scheduler.service import run_service
 
-    from aevorex.scheduler.jobs import start_scheduler
+    return await run_service()
 
-    await start_scheduler()
-    return {"stopped": 1}
+
+@scheduler_group.command("preview")
+@click.option("--hours", type=float, default=48.0, show_default=True, help="Look-ahead window")
+@click.option("--from", "start_text", default=None, help="UTC start, ISO-8601 (default: now)")
+@click.option("--offline", is_flag=True, help="Skip Supabase; demo markets only")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+def scheduler_preview(hours: float, start_text: str | None, offline: bool, as_json: bool) -> None:
+    """Dry run: print every check/refresh the service would fire. Executes nothing."""
+    _run_untracked(lambda: _scheduler_preview(hours, start_text, offline, as_json))
+
+
+async def _scheduler_preview(
+    hours: float, start_text: str | None, offline: bool, as_json: bool
+) -> None:
+    from datetime import UTC, datetime
+
+    from aevorex.publisher.remote import publisher_engine
+    from aevorex.scheduler.cities import discover, remote_org_market_reader
+    from aevorex.scheduler.config import load_config
+    from aevorex.scheduler.preview import (
+        NightlyInput,
+        build_preview,
+        refresh_durations,
+        render_preview,
+        simulate_nightly,
+    )
+    from aevorex.scheduler.preview import as_json as preview_json
+
+    config = load_config(settings.scheduler_config_path)
+    engine = None
+    reader = None
+    if not offline and settings.supabase_direct_connection_url is not None:
+        engine = publisher_engine()
+        reader = remote_org_market_reader(engine)
+    try:
+        discovery, _ = await discover(config, reader)
+    finally:
+        if engine is not None:
+            await engine.dispose()
+    start = (
+        datetime.fromisoformat(start_text).astimezone(UTC) if start_text else datetime.now(UTC)
+    )
+    runs = build_preview(discovery.active, config, start, hours)
+    durations = await refresh_durations(discovery.active, config)
+    capacity = simulate_nightly(
+        [
+            NightlyInput(
+                slug, city.timezone, config.for_market(slug), city.stagger_minutes,
+                *durations[slug],
+            )
+            for slug, city in sorted(discovery.active.items())
+        ],
+        start,
+    )
+    if as_json:
+        click.echo(json.dumps(preview_json(runs, capacity), indent=2))
+    else:
+        click.echo(render_preview(
+            runs, capacity, unsupported=discovery.unsupported,
+            remote_ok=discovery.remote_ok and (reader is not None or offline),
+        ))
+
+
+@scheduler_group.command("run-now")
+@click.option("--market", "market_slug", default=None,
+              help="Market slug (not needed for analyze/market-stats)")
+@click.option(
+    "--job",
+    type=click.Choice(["check", "refresh", "nightly", "analyze", "market-stats", "publish"]),
+    required=True,
+    help="check = search check (+refresh/analyze/publish if changed); nightly = full refresh chain",
+)
+@click.option("--wait/--no-wait", default=False, help="Wait for a busy lane instead of failing")
+def scheduler_run_now(market_slug: str | None, job: str, wait: bool) -> None:
+    """Run one scheduled chain immediately, under the same locks as the service."""
+    if job not in {"analyze", "market-stats"} and not market_slug:
+        raise click.UsageError("--market is required for this job")
+    _run_untracked(lambda: _scheduler_run_now(market_slug or "*", job.replace("-", "_"), wait))
+
+
+async def _scheduler_run_now(slug: str, job: str, wait: bool) -> None:
+    from aevorex.publisher.markets import market_definition
+    from aevorex.scheduler.cities import ActiveCity, city_zips, discover
+    from aevorex.scheduler.config import load_config
+    from aevorex.scheduler.jobs import JobRunner
+    from aevorex.scheduler.ops import EngineOperations
+    from aevorex.scheduler.slots import stagger_offset_minutes
+
+    config = load_config(settings.scheduler_config_path)
+    discovery, _ = await discover(config, None)
+    if slug != "*" and slug not in discovery.active:
+        definition = market_definition(slug)  # supported slug that is merely not demo/org-active
+        zips = city_zips(definition.city, definition.state)
+        discovery.active[definition.slug] = ActiveCity(
+            definition.slug, definition.city, definition.state, definition.timezone, zips,
+            ("manual",),
+            stagger_offset_minutes(definition.slug, zips, config.for_market(slug).stagger_minutes),
+        )
+    ops = EngineOperations()
+    runner = JobRunner(config, ops, lambda: discovery.active, wait_for_locks=wait)
+    try:
+        result = await runner.run_now(slug, job)
+    finally:
+        await ops.close()
+    click.echo(json.dumps(
+        {"market": result.slug, "job": result.kind, "status": result.status,
+         "reason": result.reason, "stages": result.stages},
+        indent=2, sort_keys=True, default=str,
+    ))
+    if result.status in {"failed", "skipped"}:
+        raise click.exceptions.Exit(1)
+
+
+@scheduler_group.command("clock-check")
+def scheduler_clock_check() -> None:
+    """Compare the laptop clock with NTP (falls back to an HTTPS Date header)."""
+    _run_untracked(_scheduler_clock_check)
+
+
+async def _scheduler_clock_check() -> None:
+    from aevorex.scheduler.config import load_config
+    from aevorex.scheduler.drift import check_clock
+
+    service = load_config(settings.scheduler_config_path).service
+    reading = await check_clock(service.clock_warn_seconds, service.clock_fail_seconds)
+    click.echo(json.dumps(
+        {"status": reading.status, "source": reading.source,
+         "offset_seconds": reading.offset_seconds}, indent=2))
+    if reading.status == "fail":
+        raise click.exceptions.Exit(2)
+
+
+@scheduler_group.command("soak-start")
+@click.option("--label", default=None, help="Soak label (default: soak-YYYYMMDD-HHMM)")
+def scheduler_soak_start(label: str | None) -> None:
+    """Record the 'before' publisher status for a soak run."""
+    _run_untracked(lambda: _soak_start(label))
+
+
+async def _soak_start(label: str | None) -> None:
+    from datetime import UTC, datetime
+
+    from aevorex.scheduler import report
+
+    now = datetime.now(UTC)
+    name = label or f"soak-{now:%Y%m%d-%H%M}"
+    status = await _with_publisher("status")
+    path = report.write_start(name, status, now)
+    click.echo(f"Soak '{name}' started; before-status saved to {path}")
+
+
+@scheduler_group.command("soak-report")
+@click.option("--label", required=True)
+@click.option("--append/--print-only", default=True, help="Append to docs/progress.md")
+def scheduler_soak_report(label: str, append: bool) -> None:
+    """Capture 'after' status, summarise per-run metrics and append to docs/progress.md."""
+    _run_untracked(lambda: _soak_report(label, append))
+
+
+async def _soak_report(label: str, append: bool) -> None:
+    from datetime import UTC, datetime
+
+    from aevorex.scheduler import report
+
+    saved = report.read_start(label)
+    started = datetime.fromisoformat(saved["started_at"])
+    now = datetime.now(UTC)
+    after = await _with_publisher("status")
+    runs = await report.load_runs(started)
+    markdown = report.render_report(
+        label, started, now, saved["before"], json.loads(json.dumps(after, default=str)),
+        runs, "Services: aevoraex-scheduler under NSSM on the Windows laptop.",
+    )
+    if append:
+        report.append_progress(markdown)
+        click.echo("Appended to docs/progress.md")
+    else:
+        click.echo(markdown)
+
+
+def _run_untracked(operation: Callable[[], Awaitable[None]]) -> None:
+    """Operator commands record their own stage runs; they must not double-count."""
+
+    async def execute() -> None:
+        try:
+            await operation()
+        finally:
+            await close_engine()
+
+    try:
+        asyncio.run(execute())
+    except click.exceptions.Exit:
+        raise
+    except Exception as exc:
+        error_class = type(exc).__name__
+        logger.error("Command failed: error_class=%s", error_class)
+        raise click.ClickException(f"Command failed ({error_class})") from None
 
 
 @cli.command("market-stats")

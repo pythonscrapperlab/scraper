@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     scraper_retries: int = 3
     scraper_retry_delay: int = 5  # seconds
     scraper_concurrent_urls: int = 3  # Conservative detail-page concurrency
+    refresh_batch_size: int = 150  # Detail URLs fetched, written and settled per batch
 
     # === Transport: Playwright ===
     playwright_headless: bool = True
@@ -56,6 +57,13 @@ class Settings(BaseSettings):
     healthchecks_publisher_url: SecretStr | None = None
     publisher_batch_size: int = 2000
 
+    # === Observability (all optional; every integration is a no-op when unset) ===
+    sentry_dsn: SecretStr | None = None
+    sentry_environment: str = "production"
+    healthchecks_scheduler_url: SecretStr | None = None  # 10-minute service heartbeat
+    healthchecks_runs_url: SecretStr | None = None  # per-run start/success/fail pings
+    healthchecks_backup_url: SecretStr | None = None  # nightly pg_dump ping
+
     # === Scraping: Zillow ===
     zillow_enabled: bool = True
     zillow_base_url: str = "https://www.zillow.com"
@@ -74,12 +82,9 @@ class Settings(BaseSettings):
     # Comma-separated list of states (e.g., "FL,CA")
     target_states_str: str = Field(default="FL,CA", validation_alias="target_states")
 
-    # === Scheduler ===
-    scheduler_enabled: bool = False
-    scheduler_zillow_interval_hours: int = 6
-    scheduler_redfin_interval_hours: int = 6
-    scheduler_realtor_interval_hours: int = 6
-    scheduler_scoring_interval_hours: int = 6
+    # === Scheduler (cadence/window/stagger live in config/scheduler.yaml) ===
+    scheduler_paused: bool = False  # service stays up and heartbeats, but runs no jobs
+    scheduler_config_path: str = "config/scheduler.yaml"
 
     # === Scoring ===
     scoring_enabled: bool = True
