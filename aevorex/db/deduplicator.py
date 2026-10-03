@@ -435,7 +435,6 @@ class Deduplicator:
                 list(source_prices.values())
             )
             existing.source_count = Deduplicator._count_sources(existing) # type: ignore
-            existing.last_seen_at = utc_now() # type: ignore
 
             # Flag for rescoring only if a scalar column genuinely changed
             # value — session.is_modified() does a real equality comparison
@@ -448,6 +447,12 @@ class Deduplicator:
             # rows, not attributes on this Property instance.
             if session.is_modified(existing, include_collections=False):
                 existing.needs_analysis = True # type: ignore
+
+            # Stamped only AFTER the check above: last_seen_at always differs
+            # from the persisted value, so setting it first made every
+            # re-scrape look modified and re-queued the whole market for
+            # analysis (audit 2026-10-03, finding 2).
+            existing.last_seen_at = utc_now() # type: ignore
 
             property_obj = existing
 
