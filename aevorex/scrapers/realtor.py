@@ -13,6 +13,9 @@ class RealtorScraper(BaseScraper):
     
     Realtor.com exposes property data via JSON-LD schema and internal API.
     """
+    
+    SOURCE = "realtor"
+    platform = "realtor"
 
     def __init__(self):
         """Initialize Realtor scraper."""

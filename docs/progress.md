@@ -166,4 +166,4 @@ Soak `e5-7d` started 2026-10-03 10:20Z. One row per day from `main.py scheduler 
 
 | day (local) | window UTC | checks ok/failed | refreshes ok/failed | refresh p50 / max min | block rate | late events | alerts / briefs queued | local DB MiB | cloud DB MiB |
 |---|---|---|---|---:|---:|---:|---|---:|---:|
-| 2026-10-03 | 10-02 10:20Z → 10-03 10:20Z | 6/0 | 0/4 | 2.9 / 5.4 | n/a | 0 | 0 / 0 | 1172.5 | 88.1 |
+| 2026-10-03 | 10-02 18:55Z → 10-03 18:55Z | 23/9 | 0/6 | 4.3 / 240.0 | n/a | 8 | 0 / 0 | 1314.3 | 189.77 |

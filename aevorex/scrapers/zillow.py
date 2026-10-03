@@ -13,6 +13,9 @@ class ZillowScraper(BaseScraper):
     
     Extracts __NEXT_DATA__ JSON embedded in page for property listings.
     """
+    
+    SOURCE = "zillow"
+    platform = "zillow"
 
     def __init__(self):
         """Initialize Zillow scraper."""

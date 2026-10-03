@@ -103,7 +103,7 @@ class BaseScraper(ABC):
             
             results["stats"]["total"] = len(urls)
 
-            for url in urls[:2]:
+            for url in urls:
                 try:
                     raw = await self.fetch(url)
                     if raw is None:
