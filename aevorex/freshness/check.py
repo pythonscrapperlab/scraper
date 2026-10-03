@@ -10,6 +10,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aevorex.config import settings
 from aevorex.db.models import (
     ChangeEvent,
     ListingPresence,
@@ -26,6 +27,18 @@ from aevorex.freshness.types import PreviousListing, SearchListing
 
 logger = logging.getLogger("aevorex.freshness.check")
 CHECK_CADENCE_MINUTES = 120
+
+
+class SnapshotRejected(RuntimeError):
+    """The snapshot is implausibly small next to the previous complete one."""
+
+
+def snapshot_is_plausible(previous: int, current: int, min_ratio: float) -> tuple[bool, float | None]:
+    """Return (accepted, ratio). With no prior complete snapshot everything is accepted."""
+    if previous <= 0:
+        return True, None
+    ratio = current / previous
+    return (current > 0 and ratio >= min_ratio), ratio
 
 
 async def run_check(
@@ -67,6 +80,23 @@ async def apply_snapshot(
         market_row = _market_row(market)
         session.add(market_row)
         await session.flush()
+
+    previous_count = (
+        int(market_row.listings_active or 0) if market_row.last_checked_at is not None else 0
+    )
+    accepted, ratio = snapshot_is_plausible(
+        previous_count, len(listings), settings.check_min_snapshot_ratio
+    )
+    if ratio is not None:
+        logger.info(
+            "Snapshot ratio: market=%s previous=%s current=%s ratio=%.3f min=%.2f accepted=%s",
+            market.slug, previous_count, len(listings), ratio,
+            settings.check_min_snapshot_ratio, accepted,
+        )
+    if not accepted:
+        # Raised before any write: no absence counting, no events, and
+        # last_checked_at is not advanced (run_check marks the market failed).
+        raise SnapshotRejected(market.slug)
 
     redfin_ids = {listing.redfin_id for listing in listings}
     properties = {}

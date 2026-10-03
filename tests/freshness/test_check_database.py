@@ -78,16 +78,20 @@ async def test_second_absence_confirms_delisted(
     market = Market("absence-fl", "Absence", "FL", "2")
     try:
         async with sessions() as session:
-            await apply_snapshot(session, market, [_listing("absent-1")])
+            # Five listings, then one disappears: 80% of the previous snapshot is
+            # a plausible shrink (an empty snapshot would be rejected by the guard).
+            others = [_listing(f"present-{i}") for i in range(4)]
+            await apply_snapshot(session, market, [_listing("absent-1"), *others])
             await session.commit()
-            first = await apply_snapshot(session, market, [])
+            first = await apply_snapshot(session, market, others)
             await session.commit()
-            second = await apply_snapshot(session, market, [])
+            second = await apply_snapshot(session, market, others)
             await session.commit()
             presence = (
                 await session.execute(
                     select(ListingPresence).where(
-                        ListingPresence.market_slug == market.slug
+                        ListingPresence.market_slug == market.slug,
+                        ListingPresence.redfin_id == "absent-1",
                     )
                 )
             ).scalar_one()
