@@ -87,3 +87,6 @@ docs/*
 *output
 old.env
 raw.ipynb
+
+# Local agent settings can embed credentials in allow-rules; never commit
+.claude/settings.local.json
