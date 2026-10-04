@@ -275,3 +275,87 @@
   row if re-run, and never back-fills a day it did not observe. The first row's trailing 24 h
   includes the E4 service restarts of 2026-10-03.
 
+
+## E6 - stabilise and slim (branch `fix/e6-stabilise-slim`, 2026-10-04)
+
+Audit 2026-10-03 found correctness bugs and a publisher that sent far more than the web renders. Fixed in nine steps, one commit each.
+
+### Step 1 - valuation v2 restore
+
+- **The `backup/stash*` branches do not exist**; the work lives only in `stash@{0..2}`. Restored from `stash@{0}` (dated 2026-09-30) directly. `tests/valuation/test_v3_valuation.py` was in stash 0's untracked part (`stash@{0}^3`), not stash 2. All stashes are left in place.
+- Restored `valuation/{engine,rehab,rent,comps}.py` (rehab, rent, comps locality filter, ARV exit cap, uncorroborated shrink) and `VALUATION_VERSION = "v2"`. Re-applied the E0 logging rule: class-only logging, no `exc_info=True`. No scorer was touched.
+- Why it regressed: `main` still carried the v1 valuation files, so since E5 the service has written `v1` rows (1,397 at 2026-10-04, all one 2026-10-03 10:30 batch) next to 9,926 `v2` rows (all computed 2026-09-19 22:15-22:26). Those v1 rows were **not** re-valued: re-valuing changes their scores, which is an owner call. They are reported by the soak.
+- Reproduction proof (`scripts/prove_valuation_v2.py`, read-only, rolls back, output in `docs/valuation-v2-repro.md`): of 200 stored-v2 rows, **158 reproduce market_value, arv, rehab_mid, rent within 1% with identical flags; 42 differ.**
+  - 8 differ because the property row and comps changed after 2026-09-19.
+  - 34 have no per-property input change. 19 are rent-only, driven by the market-wide zip x bedroom rent index (median of rental `price_history`, 24-month rolling window, +2,784 properties since). Replaying the index as of the stored run time removes 7 of them. The other 15 no-change rows are market-baseline drift (`market_stats` is recomputed nightly with no history, so it cannot be replayed) or code evolution.
+  - **Limit of the proof:** stash 0 post-dates the stored run by 11 days of uncommitted work. Code drift between those two points cannot be ruled out and cannot be recovered. The honest statement is: the restored code reproduces 79% exactly on today's data and explains the rest by documented data drift, not proof of byte-identity.
+
+### Follow-ups logged (out of scope for E6)
+
+- Mid-term lens seasonal cap (product decision pending).
+- The two MAO formulas (valuation `max_allowable_offer` vs the fix-flip scorer's).
+- Dead config fields.
+- Percentile pools that include delisted rows.
+- Scheduler backoff / `publish_debt` persistence across restarts.
+- Ingestion parser bugs.
+- Stale README / CLAUDE.md.
+- Backfill of the 1,397 `v1` valuation rows (changes their scores).
+
+### Step 2 - needs_analysis false positives
+
+`Deduplicator.upsert` stamped `last_seen_at = now` before `session.is_modified(...)`, so every re-scrape of an identical record looked modified and re-queued the property for analysis. `last_seen_at` is now stamped after the check. DB test: identical re-upsert leaves `needs_analysis=False`; a price change sets it True (fails without the fix).
+
+### Step 3 - snapshot sanity guard
+
+`apply_snapshot` raises `SnapshotRejected` before any write when the previous complete snapshot had listings and the new one is empty or below `CHECK_MIN_SNAPSHOT_RATIO` (default 0.7) of it. No events, no absence counting, no `last_checked_at` advance; `run_check` marks the market `failed`. The ratio is logged on every check. "Previous complete snapshot" is `market_freshness.listings_active`, which only an accepted snapshot writes, and only counts once `last_checked_at` is set (first-ever check is always accepted). The E2 two-absence test used an empty snapshot and was changed to a five-to-four shrink.
+
+### Step 4 - publisher sends only what changed
+
+- New local tables `publish_state` (per property: content / scores / children hashes) and `publish_market_state` (events watermark, market/daily/demo-snapshot hashes). Alembic `e6b3d5f7a9c1`.
+- The hash covers the exact serving payload, **minus volatile stamps** `updated_at, last_seen_at, refreshed_at, dom, dom_mls` (scores: `computed_at`, `prev_*`; children: `computed_at`). A nightly refresh re-stamps those on every listing, so hashing them re-sends the whole market nightly. **Consequence for the web:** on an unchanged listing these columns are as of the last real change; days-on-market should be derived from `listed_at` where it matters, and market-level `last_refreshed_at` remains the honest freshness surface. Owner call if you would rather pay for exact `dom` (the cheap alternative is a weekly staggered re-push of the properties row).
+- A property absent from the cache is re-sent in every group whatever the local state says, so a manual delete or rebuild self-heals. Departures are the cache ids not in the local keep-set.
+- Events: only `observed_at` after the market's watermark (minus a 10-minute overlap; inserts are `ON CONFLICT DO NOTHING` and report true row counts). First push of a market sends 14 days.
+- The `markets` row, `market_daily` and each demo snapshot are written only when their hash moved. The run row is written once, at the end, and only if something was written (no more `running` row plus an update). Failed pushes record a failed run row.
+- Remote pruning on every push: `market_daily` 90 d, `runs` 30 d, `heartbeats` 7 d (counted first, so a clean table costs no write). `change_events` is not pruned (not in scope; ~1 MB/week at current volume; follow-up).
+- Proof: two consecutive no-change pushes issue only `update serving.markets` and `insert serving.heartbeats` (statement-level recording on the engine in `tests/publisher/test_incremental.py`).
+
+### Step 5 - publisher sends only what the web renders (serving v3)
+
+- Curated `features` (25 named keys, `aevorex/publisher/slim.py`), `redact.py` for descriptions/summaries, history/tax/comps caps, slim breakdown, 7-day delisted retention via one function (`retention_cutoff`; the test-only `retained_delisted` helper is gone and the boundary is tested through `_load_local`'s SQL path). Schema contract in `docs/schema.md`; handover in `docs/handover-web.md` section 7. Supabase migration `20261004090000_e6_serving_v3.sql`.
+- **Redaction evidence.** Surveyed all 12,981 live descriptions before writing the rules: 11 contain phone numbers, 0 e-mails, ~1,100 use call/text/contact wording (almost all generic: "call home", "easy reach"). The committed tests use an invented corpus modelled on those patterns (22 leaking, 10 benign) so no real person's number is committed; `scripts/check_redaction.py` runs the same checks on the live rows: 12,981 descriptions + 12,810 summaries, 0 phone/e-mail/URL residue, 0 over the cap. 34 name phrases were rewritten; a few are place names ("call Lake Nona") - cosmetic, accepted.
+- History excludes rental events (the web filters `is_rental = false`; rentals feed only the local rent index).
+- Breakdown `drivers[].field` is kept only when it names a column the web already holds (properties / valuation columns, flag keys). **Assumption:** the web repo was not available to check which `field` values it reads; this is the narrowest rule that keeps deep-linking possible. Confirm with the web team.
+- `alert_events`: the live project had `alert_events_property_fk ... ON DELETE CASCADE` and `property_id NOT NULL`, added outside this repo's migrations (the 0000 stub has no FK). The new migration replaces it with `ON DELETE SET NULL` and makes the column nullable.
+- **Size reality check (measured, payload JSON, Orlando, per published property):** scores 15.3 KB (of which `breakdown` 11.4 KB: components 3.9, adjustments 3.9 of which 2.5 are not-applied gates, `rationale` 2.2 duplicated from the `rationale` column, `flags` 0.4 also a column), properties 2.3, images 1.6, history 1.3, comps 1.3, neighbourhood 0.9, valuation 0.9, features 0.8, tax 0.5, agents 0.2: **25.1 KB total**. Even with zero score data the remaining tables are ~9.8 KB, so the 12 KB/property target cannot be met by the step 5 list alone. Levers if the target stands (not applied, each changes the web contract): drop the nine keys of `breakdown` that duplicate score columns (-3.2 KB, no information lost); publish `breakdown` only for `top`/`strong` rows (-9 KB, the anatomy panel disappears for the 80% `rest` tier); 6 images instead of 12 (-0.8 KB).
+
+### Step 6 - hard size guard
+
+`classify_size` thresholds are unchanged (350 warn, 420 stop, 450 page, MiB, exact boundaries). Behaviour now: below 420 everything is written; at or above **420** a push writes the market's freshness, property rows and scores but **no child rows** (and no events, demo snapshots or `market_daily`, whose state is left untouched so they go out once there is room); at or above **450** it writes freshness and a heartbeat only. The size is re-read before the children group, so a push that grows the database across the line mid-way stops there. Departures (rows leaving the keep-set) are still deleted at any size: deleting is how the cache shrinks. The run is `partial` and the owner is paged (Healthchecks `/fail`) at both 420 and 450; a new market is still refused at 420. State for withheld groups is not recorded, so they are sent when there is room. Tests pin the size at 419.99, 420, 449.99 and 450 MiB and at a mid-push crossing.
+
+### Step 7 - security cleanup
+
+- **`public.rls_auto_enable()`** is the function behind the event trigger `ensure_rls`, which Supabase installs for its "automatically enable RLS" project setting. It is neither ours nor a manual step in this repo. It was `SECURITY DEFINER` and executable by `anon`/`authenticated` (callable through the REST API). **Revoked, not dropped** (migration `20261004091000_e6_security.sql`, applied to the live project): an event trigger is fired by the server, not through EXECUTE rights, so the guard stays. Verified live afterwards: the only `SECURITY DEFINER` function in `public/serving/app` has `anon=false, authenticated=false`, and creating a throw-away table in `public` (rolled back) still came back with RLS enabled. The advisor UI itself cannot be run from here (no Supabase CLI/MCP on this machine); the check above is the query its lint is based on. Dropping instead is two statements, noted in the migration header.
+- **`old.env`**: untracked, ignored by the repo's `.gitignore` (line 88), never in git history. It is a stale second copy of live credentials: its `DB_PASSWORD`, `PROXY_USER`, `PROXY_PASSWORD`, `SUPABASE_PROJECT_URL`, `SUPABASE_PUBLISHABLE_KEY` and `SUPABASE_DIRECT_CONNECTION_URL` are byte-identical to the current `.env`. Not deleted (your file); delete it.
+- **`.claude/settings.local.json`**: untracked and never committed, but ignored only by this machine's *global* git ignore, not by the repo. Added to the repo `.gitignore`. It **does contain a live secret**: one allow-rule embeds the local PostgreSQL password (`PGPASSWORD=...`), equal to the current `DB_PASSWORD`. Not edited (it is your permission file).
+- **Rotate**: (1) the local PostgreSQL `DB_PASSWORD` - it is short, sits in plain text in both files, and appeared in this session's tool output; follow the runbook's local-password rotation; (2) the Supabase database password (it is inside `SUPABASE_DIRECT_CONNECTION_URL` in the `old.env` copy), then update `.env`; (3) the Webshare proxy password (`PROXY_PASSWORD`, and `PROXY_USER` if Webshare lets you), in the `old.env` copy. Nothing to rotate for the publishable key (public by design) or the project URL. `SUPABASE_SERVICE_ROLE_KEY` is not configured anywhere on this machine. None of these were found in git history or in any tracked file.
+- Migration ordering note: `20261004091000` was applied before `20261004090000` (serving v3). The Supabase CLI will want `db push --include-all` the first time it sees that history; `scripts/apply_supabase_migration.py` (used here because the CLI is not installed) records history rows itself.
+
+### Step 8 - reclaim and measure (2026-10-04, live)
+
+Sequence: applied `20261004090000` (v3 + alert FK) and `20261004091000` (security) with `scripts/apply_supabase_migration.py`; `publisher rebuild --all` (11 min for five markets); `scripts/vacuum_serving.py` (VACUUM FULL ANALYZE on all 17 serving tables; the longest lock was `scores`, 9.9 s, the rest under 1.5 s). The scheduler could not be stopped without UAC; it stayed on old code, so its pushes would have failed the v3 check until the elevated restart at 01:04 local, which succeeded.
+
+| | before | after rebuild, before VACUUM | after VACUUM FULL |
+|---|---:|---:|---:|
+| `pg_database_size` | 189.77 MiB | 164.75 MiB | **119.82 MiB** |
+| published properties | 6,065 | 6,065 | 6,065 |
+| serving KB / property | 29.97 | 25.69 | **18.11** |
+
+Per table, before -> after (total KiB; live / dead tuples): scores 80,784 -> 57,840 (20,880 / 0); properties 18,192 -> 12,152; images 14,568 -> 10,696; neighbourhood 8,808 -> 7,104; history 18,232 -> 6,024 (72,426 -> 32,493 rows); comps 7,312 -> 5,504; features 18,440 -> 3,696; tax_history 9,744 -> 2,632 (77,384 -> 27,950 rows); valuation 3,184 -> 2,344; agents 1,176 -> 912; change_events 912 -> 648; the rest under 100. Dead tuples before: features 1,226, tax_history 15,183, scores/properties thousands; after: 0 everywhere. Full JSON in `logs/e6/before.json`, `after-rebuild-prevacuum.json`, `after.json`.
+
+**Targets not met.** 18.1 KB/property vs 12 KB. The published set is 6,065 of the ~10,400 locally listed properties (the rest have no detail fetch yet), so the five cities will add roughly 70%: ~205 MiB at today's density vs the 150 MiB target. See the size reality check under step 5 for the levers (breakdown de-duplication -3.2 KB, `rest`-tier breakdowns -9 KB, 6 images -0.8 KB). Scores alone are 9.5 KB/property. Owner decision needed.
+
+### Step 9 - restart and soak
+
+Service restarted at 2026-10-04 01:04 local on the E6 code. Task `aevoraex-e6-soak` runs `scripts/e6_soak.py` every 6 hours for 30 hours (appends to `logs/e6/soak.jsonl`: cloud size, pushes, zero-change pushes, rows written per push, snapshot-guard rejections, valuation versions). **The 24-hour result does not exist yet.** First sample 2026-10-04 01:06 local: 119.58 MiB, 6,065 properties, valuation versions v1 = 1,397, v2 = 9,926, 0 guard rejections.
+
+**Upstream problem found:** since ~2026-10-03 15:30Z every Redfin check fails (`SearchFetchError`, detail fetches `ProxyError`); all five markets are `late`/`failed`. Looks like the Webshare proxy (bandwidth or credentials), not E6 code. Until checks succeed there are no pushes to measure, and the 24 h soak will show zero pushes.

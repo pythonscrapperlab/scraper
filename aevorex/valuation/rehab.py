@@ -81,6 +81,32 @@ class RehabConfig:
     roof_replace_age_premium: int = 40
     hvac_replace_age: int = 15
 
+    # --- era-dated building systems ---
+    # These are the four-point inspection items Florida insurers and lenders
+    # actually fail a house on, and where flips lose money after demolition.
+    # Each is a known five-figure line derivable from build year, and each
+    # is skipped when the remarks say the work is done or the property was
+    # renovated recently enough that systems were plausibly addressed.
+    #
+    # Cast iron drain lines (pre-1975): rusted through by now, re-pipe is a
+    # slab-cut job. Polybutylene supply lines (1978-1995): fail without
+    # warning, insurers refuse to write them. Aluminum branch wiring
+    # (1965-1975) and Federal Pacific / Zinsco panels (1960-1985): fire risk,
+    # panel replacement plus pigtailing or rewire.
+    cast_iron_before_year: int = 1975
+    cast_iron_repipe_per_sqft: float = 9.0
+    cast_iron_repipe_min: float = 12_000.0
+    polybutylene_years: Tuple[int, int] = (1978, 1995)
+    polybutylene_repipe_per_sqft: float = 5.0
+    polybutylene_repipe_min: float = 6_000.0
+    electrical_risk_years: Tuple[int, int] = (1960, 1985)
+    electrical_base: float = 6_000.0
+    electrical_per_sqft: float = 2.5
+    # A renovation this recent is assumed to have dealt with systems.
+    systems_addressed_within_years: int = 12
+    # Attached units share risers, so the in-unit share of a re-pipe is smaller.
+    attached_plumbing_share: float = 0.5
+
     # Uncertainty band around the mid estimate.
     low_multiplier: float = 0.70
     high_multiplier: float = 1.45
@@ -105,6 +131,15 @@ _RECENTLY_DONE = re.compile(
     r"new roof|roof (is )?new|newly renovated|fully renovated|completely remodel|"
     r"brand new|just renovated|new hvac|new a/?c", re.I
 )
+# Systems explicitly stated as replaced — each removes the matching era adder.
+_REPIPED = re.compile(
+    r"re-?piped?|re-?plumb\w*|new plumbing|updated plumbing|all new pipes|"
+    r"\bpex\b|copper plumbing|new (water|supply) lines", re.I
+)
+_REWIRED = re.compile(
+    r"re-?wired|new (electrical )?panel|updated (electrical|electric|panel)|"
+    r"new (electrical|electric|wiring)|electrical (has been )?updated|200[- ]amp", re.I
+)
 
 
 def estimate_rehab(
@@ -117,6 +152,7 @@ def estimate_rehab(
     has_impact_glazing: Optional[bool] = None,
     description: Optional[str] = None,
     ai_summary: Optional[str] = None,
+    property_type: Optional[str] = None,
     config: RehabConfig = DEFAULT_REHAB_CONFIG,
 ) -> Dict[str, Any]:
     """
@@ -197,6 +233,17 @@ def estimate_rehab(
                 config.impact_window_min, config.impact_window_cost_per_sqft * sqft
             )
 
+    # ---- era-dated systems (four-point inspection items) ----
+    era_systems = _era_system_adders(
+        year_built=year_built, renovation_age=renovation_age, sqft=sqft,
+        resolved_condition=resolved, text_blob=text_blob,
+        property_type=property_type, config=config,
+    )
+    adders.update(era_systems)
+    if era_systems:
+        flags.append("era_dated_building_systems_priced_into_rehab")
+        basis["era_systems"] = sorted(era_systems)
+
     subtotal = base_cost + sum(adders.values())
     contingency = subtotal * config.contingency_pct
     mid = subtotal + contingency
@@ -213,6 +260,46 @@ def estimate_rehab(
         "condition_class": resolved,
         "flags": flags,
     }
+
+
+def _era_system_adders(
+    *, year_built, renovation_age, sqft, resolved_condition, text_blob, property_type, config,
+) -> Dict[str, float]:
+    """
+    Plumbing and electrical scope implied by the build year alone.
+
+    Returns whole-unit cost lines keyed by system. Nothing is added for new
+    construction, for a renovation recent enough to have addressed systems,
+    or where the remarks state the work is done.
+    """
+    if not year_built or year_built < 1800 or resolved_condition == "new":
+        return {}
+    if renovation_age is not None and renovation_age <= config.systems_addressed_within_years:
+        return {}
+
+    attached = any(t in (property_type or "").lower()
+                   for t in ("condo", "co-op", "townhouse", "townhome"))
+    plumbing_share = config.attached_plumbing_share if attached else 1.0
+    adders: Dict[str, float] = {}
+
+    if not _REPIPED.search(text_blob):
+        if year_built < config.cast_iron_before_year:
+            adders["cast_iron_drain_repipe"] = plumbing_share * max(
+                config.cast_iron_repipe_min, config.cast_iron_repipe_per_sqft * sqft
+            )
+        low, high = config.polybutylene_years
+        if low <= year_built <= high:
+            adders["polybutylene_repipe"] = plumbing_share * max(
+                config.polybutylene_repipe_min, config.polybutylene_repipe_per_sqft * sqft
+            )
+
+    low, high = config.electrical_risk_years
+    if low <= year_built <= high and not _REWIRED.search(text_blob):
+        adders["electrical_panel_and_wiring"] = (
+            config.electrical_base + config.electrical_per_sqft * sqft
+        )
+
+    return adders
 
 
 def _age(year: Optional[int]) -> Optional[int]:

@@ -143,6 +143,32 @@ class ChangeEvent(Base):
     )
 
 
+class PublishState(Base):
+    """What the publisher last pushed for each property (hashes of the exact serving payloads)."""
+
+    __tablename__ = "publish_state"
+
+    market_slug = Column(String(160), primary_key=True)
+    property_id = Column(UUID(as_uuid=True), primary_key=True)
+    content_hash = Column(String(64), nullable=False)
+    scores_hash = Column(String(64), nullable=False)
+    children_hash = Column(String(64), nullable=False)
+    published_at = Column(DateTime(timezone=False), nullable=False, default=utc_now)
+
+
+class PublishMarketState(Base):
+    """Per-market publisher watermark and hashes of the small market-level payloads."""
+
+    __tablename__ = "publish_market_state"
+
+    market_slug = Column(String(160), primary_key=True)
+    events_watermark = Column(DateTime(timezone=False), nullable=True)
+    last_push_at = Column(DateTime(timezone=False), nullable=True)
+    market_hash = Column(String(64), nullable=True)
+    daily_hash = Column(String(64), nullable=True)
+    snapshot_hashes = Column(JSONB, nullable=False, default=dict)
+
+
 class AnalysisTier(Base):
     """Previous published rank state used to detect tier and percentile moves."""
 

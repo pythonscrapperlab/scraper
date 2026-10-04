@@ -167,3 +167,7 @@ Soak `e5-7d` started 2026-10-03 10:20Z. One row per day from `main.py scheduler 
 | day (local) | window UTC | checks ok/failed | refreshes ok/failed | refresh p50 / max min | block rate | late events | alerts / briefs queued | local DB MiB | cloud DB MiB |
 |---|---|---|---|---:|---:|---:|---|---:|---:|
 | 2026-10-03 | 10-02 18:55Z → 10-03 18:55Z | 23/9 | 0/6 | 4.3 / 240.0 | n/a | 8 | 0 / 0 | 1314.3 | 189.77 |
+
+## 2026-10-04 - E6 stabilise and slim
+
+Branch `fix/e6-stabilise-slim`, one commit per step (E6.1-E6.7; steps 8-9 are live operations recorded in `docs/decisions.md`). Valuation v2 restored (158/200 reproduce within 1%); `needs_analysis` false positives fixed; snapshot sanity guard; publisher sends only changed rows (publish_state, watermarked events, remote pruning); serving v3 payload (curated features, redaction, caps, 7-day retention, alert FK SET NULL); 420/450 MiB size guard; `rls_auto_enable` revoked. Cloud 189.77 -> 119.82 MiB (18.1 KB/property; target 12 not met). Soak pending; Redfin checks failing since 2026-10-03 15:30Z. Verification: ruff clean, mypy clean (93 files), pytest 558 passed / 2 skipped.

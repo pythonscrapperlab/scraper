@@ -32,7 +32,23 @@ from aevorex.valuation.rent import build_zip_bed_rent_index, estimate_rent
 
 logger = logging.getLogger("aevorex.valuation.engine")
 
-VALUATION_VERSION = "v1"
+VALUATION_VERSION = "v2"
+
+# WINNER'S CURSE. Our value more than this far above the asking price, with
+# nothing corroborating it, is far more likely to be a comp error than a
+# listing agent leaving a third of the price on the table. The asking price
+# is itself market evidence — it is the listing agent's CMA — so the value
+# is shrunk toward it rather than trusted. Corroboration means: the source
+# AVM also sits well above asking, the seller is in verified distress, or the
+# property is a stated fixer (where a deep discount is the whole point).
+UNCORROBORATED_VALUE_RATIO = 1.20
+AVM_CORROBORATION_RATIO = 1.15
+
+# EXIT CEILING. An ARV whose $/sqft sits this far above the market's own
+# 75th-percentile sold $/sqft would make the renovated house the most
+# expensive sale in the area. Buyers at that level are scarce and appraisers
+# will not support it, so ARV is capped there.
+ARV_EXIT_CEILING_RATIO = 1.25
 
 # The classic flipper's rule of thumb, generalised: offer no more than this
 # share of ARV once repairs are deducted. 70% is the textbook figure; it
@@ -51,8 +67,10 @@ AUCTION_PRICE_SUSPICION_RATIO = 0.60
 # differing. Measured across the corpus the median ratio is 1.005 and the 95th
 # percentile 1.60, so 2.0x is well outside normal variation and catches the
 # comp-mismatch cases without touching genuinely premium properties.
-MARKET_PPSF_DIVERGENCE_HIGH = 2.0
-MARKET_PPSF_DIVERGENCE_LOW = 0.5
+# Tightened from 2.0 / 0.5: at 2.0x a Cupertino-comp'd San Jose townhouse at
+# 1.8x its class median sailed through untouched.
+MARKET_PPSF_DIVERGENCE_HIGH = 1.5
+MARKET_PPSF_DIVERGENCE_LOW = 0.6
 
 
 class ValuationEngine:
@@ -156,8 +174,14 @@ class ValuationEngine:
             has_impact_glazing=amenities.get("has_impact_glazing"),
             description=prop.description,
             ai_summary=prop.ai_summary,
+            property_type=prop.property_type,
         )
         flags.extend(rehab["flags"])
+
+        # ---- winner's-curse check, once condition is known ----
+        market_value = self._shrink_uncorroborated_value(
+            prop, market_value, rehab["condition_class"], valuation, flags
+        )
 
         # ARV depends on how much renovation there is to do, so it can only be
         # finalised once condition is known. The comp layer supplies the
@@ -167,6 +191,7 @@ class ValuationEngine:
         valuation["arv"] = scale_arv_by_condition(
             market_value, valuation.pop("arv_ceiling", None), rehab["condition_class"]
         )
+        valuation["arv"] = self._cap_arv_at_market_exit(prop, valuation["arv"], market, flags)
 
         # An auction's published figure is an opening bid or deposit, not an
         # asking price, and the actual purchase price is decided in the room.
@@ -204,6 +229,7 @@ class ValuationEngine:
             market=market,
             rent_index=self._rent_index,
             property_type=prop.property_type,
+            sqft=prop.sqft,
         )
         flags.extend(rent["flags"])
 
@@ -324,6 +350,60 @@ class ValuationEngine:
                 float(valuation["valuation_confidence"]) * 0.6, 4
             )
         return blended
+
+    @staticmethod
+    def _shrink_uncorroborated_value(prop, market_value, condition_class, valuation, flags):
+        """
+        Pull a value that sits far above asking back toward the asking price
+        unless something independent says the discount is real.
+
+        The previous ranking's top ten flips were all San Jose townhouses
+        "worth" 30-80% more than asking. On the MLS in a liquid market that
+        does not happen for a week without a reason, and the reasons that do
+        exist (distress, a stated fixer, an AVM that agrees) are all visible
+        here. Absent one of them the honest estimate is between the two.
+        """
+        if not market_value or not prop.price or prop.price <= 0:
+            return market_value
+        ratio = market_value / prop.price
+        if ratio <= UNCORROBORATED_VALUE_RATIO:
+            return market_value
+
+        corroborated = False
+        if prop.avm_value and prop.avm_value >= prop.price * AVM_CORROBORATION_RATIO:
+            corroborated = True
+        if any([prop.is_reo, prop.is_foreclosure, prop.is_short_sale,
+                prop.is_probate_or_estate, prop.is_auction]):
+            corroborated = True
+        if condition_class == "fixer":
+            corroborated = True
+        if corroborated:
+            flags.append("value_far_above_asking_but_corroborated")
+            return market_value
+
+        shrunk = round((market_value + prop.price) / 2)
+        flags.append("value_far_above_asking_uncorroborated_shrunk_toward_asking")
+        valuation["market_value"] = shrunk
+        valuation["market_value_method"] = f"{valuation.get('market_value_method') or 'comps'}_shrunk"
+        if valuation.get("valuation_confidence"):
+            valuation["valuation_confidence"] = round(
+                float(valuation["valuation_confidence"]) * 0.5, 4
+            )
+        return shrunk
+
+    @staticmethod
+    def _cap_arv_at_market_exit(prop, arv, market, flags):
+        """Cap ARV at what the market's own upper-quartile sales will support."""
+        if not arv or not prop.sqft or not market:
+            return arv
+        p75 = market.get("p75_sold_ppsf")
+        if not p75 or p75 <= 0:
+            return arv
+        ceiling = float(p75) * ARV_EXIT_CEILING_RATIO * prop.sqft
+        if arv > ceiling:
+            flags.append("arv_capped_at_market_exit_ceiling")
+            return round(ceiling)
+        return arv
 
     async def _market_for(self, session: AsyncSession, prop: Property) -> Optional[dict]:
         """Resolve and cache the market baseline for a property."""

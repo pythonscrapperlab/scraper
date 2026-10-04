@@ -37,9 +37,50 @@ A weighted sales-comparison approach, which is what an appraiser does:
 """
 
 import math
+import re
 import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
+
+# LOCALITY. The "comps arrive pre-screened for locality" assumption in the
+# docstring above turned out to be false in the one place it matters most:
+# a San Jose townhouse listed at $1.998M was valued at $3.63M off four
+# detached houses in Cupertino, a different city with a school-district
+# premium. When at least this many comps share the subject's zip, comps
+# from other zips are dropped; below that they are kept but down-weighted,
+# because a thin same-zip set is still better evidence with them than
+# without.
+MIN_SAME_ZIP_COMPS_TO_DROP_OTHERS = 3
+OTHER_ZIP_WEIGHT = 0.4
+
+# PROPERTY TYPE. Comps carry no type, so a condo can be valued against
+# detached houses. The only signal available is the address: a unit marker
+# means attached. It is a heuristic (many townhouses have no unit number), so
+# mismatches are down-weighted rather than dropped, and the valuation is
+# flagged when most of the set disagrees with the subject.
+TYPE_MISMATCH_WEIGHT = 0.6
+
+_ZIP_IN_ADDRESS = re.compile(r"(\d{5})(?:-\d{4})?\s*$")
+_UNIT_MARKER = re.compile(r"(\bunit\b|\bapt\b|\bste\b|#\s*\w+|\bph\s*\d|\bpenthouse\b)", re.I)
+
+
+def comp_zip(address: Optional[str]) -> Optional[str]:
+    if not address:
+        return None
+    match = _ZIP_IN_ADDRESS.search(address)
+    return match.group(1) if match else None
+
+
+def address_looks_attached(address: Optional[str]) -> Optional[bool]:
+    """True when the address carries a unit marker, else False; None if no address."""
+    if not address:
+        return None
+    return bool(_UNIT_MARKER.search(address))
+
+
+def subject_is_attached(property_type: Optional[str]) -> bool:
+    text = (property_type or "").lower()
+    return any(t in text for t in ("condo", "co-op", "townhouse", "townhome"))
 
 # Comps outside this size band relative to the subject are excluded outright —
 # beyond roughly half to double the area they are a different product, and
@@ -110,15 +151,24 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def select_comps(comps: Sequence[Any], subject_sqft: Optional[int]) -> List[dict]:
+def select_comps(
+    comps: Sequence[Any],
+    subject_sqft: Optional[int],
+    subject_zip: Optional[str] = None,
+    subject_attached: Optional[bool] = None,
+    flags: Optional[list] = None,
+) -> List[dict]:
     """
     Filter a property's comps down to the usable, comparable ones.
 
     Returns dicts rather than ORM rows so the maths below is testable without
-    a database.
+    a database. Each dict carries `locality_weight` and `type_weight`
+    multipliers (1.0 when the comp matches the subject) for `_weight` to
+    apply; `flags`, when given, receives the data-quality notes.
     """
     usable: List[dict] = []
     now = _now()
+    flags = flags if flags is not None else []
 
     for comp in comps:
         price = getattr(comp, "price", None)
@@ -146,6 +196,7 @@ def select_comps(comps: Sequence[Any], subject_sqft: Optional[int]) -> List[dict
             if not (MIN_SIZE_RATIO <= ratio <= MAX_SIZE_RATIO):
                 continue
 
+        address = getattr(comp, "comp_address", None)
         usable.append({
             "price": price,
             "sqft": sqft,
@@ -153,8 +204,40 @@ def select_comps(comps: Sequence[Any], subject_sqft: Optional[int]) -> List[dict
             "beds": getattr(comp, "bedrooms", None),
             "baths": getattr(comp, "bathrooms", None),
             "age_days": age_days,
-            "address": getattr(comp, "comp_address", None),
+            "address": address,
+            "zip": comp_zip(address),
+            "attached": address_looks_attached(address),
+            "locality_weight": 1.0,
+            "type_weight": 1.0,
         })
+
+    # ---- locality ----
+    if subject_zip and usable:
+        same_zip = [c for c in usable if c["zip"] == subject_zip]
+        other_zip = [c for c in usable if c["zip"] and c["zip"] != subject_zip]
+        if other_zip:
+            if len(same_zip) >= MIN_SAME_ZIP_COMPS_TO_DROP_OTHERS:
+                usable = [c for c in usable if c["zip"] in (None, subject_zip)]
+                flags.append("comps_from_other_zips_dropped")
+            else:
+                for c in other_zip:
+                    c["locality_weight"] = OTHER_ZIP_WEIGHT
+                flags.append("comps_include_other_zips_downweighted")
+
+    # ---- property type ----
+    if subject_attached is not None and usable:
+        known = [c for c in usable if c["attached"] is not None]
+        mismatched = [c for c in known if c["attached"] != subject_attached]
+        for c in mismatched:
+            c["type_weight"] = TYPE_MISMATCH_WEIGHT
+        # Only the attached-subject direction is reliable: a detached subject
+        # with unit-marked comps is a clear mismatch, but an attached subject
+        # with unmarked comps may simply be a townhouse row. Flag the former
+        # always and the latter only when the whole set disagrees.
+        if known and mismatched:
+            share = len(mismatched) / len(known)
+            if (not subject_attached and share >= 0.5) or (subject_attached and share >= 0.8):
+                flags.append("comp_property_type_mismatch_suspected")
 
     return usable
 
@@ -185,6 +268,8 @@ def _weight(comp: dict, subject) -> float:
 
     if comp["age_days"] is not None:
         weight *= 0.5 ** (comp["age_days"] / RECENCY_HALF_LIFE_DAYS)
+
+    weight *= comp.get("locality_weight", 1.0) * comp.get("type_weight", 1.0)
 
     return max(weight, 1e-6)
 
@@ -225,7 +310,14 @@ def analyse_comps(comps: Sequence[Any], subject) -> Optional[Dict[str, Any]]:
 
     Returns None when there is nothing usable to work from.
     """
-    usable = select_comps(comps, getattr(subject, "sqft", None))
+    flags: List[str] = []
+    usable = select_comps(
+        comps,
+        getattr(subject, "sqft", None),
+        subject_zip=getattr(subject, "zip_code", None),
+        subject_attached=subject_is_attached(getattr(subject, "property_type", None)),
+        flags=flags,
+    )
     if not usable:
         return None
 
@@ -257,6 +349,7 @@ def analyse_comps(comps: Sequence[Any], subject) -> Optional[Dict[str, Any]]:
         "median_age_days": int(statistics.median(ages)) if ages else None,
         "median_comp_sqft": statistics.median([c["sqft"] for c in usable]),
         "total_weight": round(sum(weights), 3),
+        "flags": flags,
     }
 
 
@@ -338,6 +431,11 @@ def estimate_value_and_arv(
             "comp_median_age_days": analysis["median_age_days"],
         })
         confidence = valuation_confidence(analysis)
+        result["flags"].extend(analysis.get("flags", []))
+        if "comp_property_type_mismatch_suspected" in result["flags"]:
+            # The set is mostly the wrong product. The value is still the
+            # best available but it must not read as a confident one.
+            confidence *= 0.6
 
         comp_value = _size_adjusted_value(
             analysis["median_ppsf"], subject_sqft, analysis["median_comp_sqft"]
@@ -358,14 +456,19 @@ def estimate_value_and_arv(
             # one defers to it. Two independent estimates that agree are
             # stronger evidence than either alone.
             comp_weight = confidence
+            divergence = abs(comp_value - source_avm) / max(source_avm, 1)
+            if divergence > 0.35:
+                # Either the comp set or the AVM is wrong. The AVM is built
+                # from a far larger sample than six comps and is calibrated
+                # against actual sales, so on a serious disagreement it gets
+                # at least half the vote — a tight-but-wrong comp set used to
+                # outvote it and put a $989k townhouse at $1.32M.
+                comp_weight = min(comp_weight, 0.5)
+                result["flags"].append("comp_value_diverges_from_avm")
+                confidence *= 0.7
             blended = comp_value * comp_weight + source_avm * (1 - comp_weight)
             result["market_value"] = round(blended)
             result["market_value_method"] = "comps_avm_blend"
-            divergence = abs(comp_value - source_avm) / max(source_avm, 1)
-            if divergence > 0.35:
-                # Worth surfacing: either the comp set or the AVM is wrong, and
-                # a blended midpoint hides that rather than resolving it.
-                result["flags"].append("comp_value_diverges_from_avm")
             # Agreement between two independent methods earns a modest boost.
             confidence = min(1.0, confidence * (1.15 if divergence < 0.15 else 1.0))
         else:
