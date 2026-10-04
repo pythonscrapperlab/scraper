@@ -41,7 +41,7 @@ more `app.org_markets` rows than the plan allows.
 |---|---|
 | Live coverage list | `serving.v_market_public` where `active` (order by `city`) |
 | Freshness badge for a city | same view: `last_checked_at, next_check_at, last_refreshed_at, check_status, listings_active, changed_last_check` |
-| Landing-page demo | `serving.demo_snapshots` where `market_slug = :slug and lens = :lens` -> `payload` (JSON; 3 full rows, 5 stubs, freshness block; no agent fields, no full breakdown) |
+| Landing-page demo | `serving.demo_snapshots` where `market_slug = :slug and lens = :lens` -> `payload` (JSON `version` 3: `full` = 3 open properties, each `address, photos[5], price, beds, baths, sqft, days_listed, property_type, year_built, rank, pool_size, tier, headline{label,value,estimate[,detail,gap_to_max_offer]}, reasons[3-5], summary`; `stubs` = 5 teasers `{price_band, days_listed}`; `freshness` block; no agent fields, no breakdown) |
 
 ## 3. Signed-in data, by need
 

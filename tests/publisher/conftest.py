@@ -19,6 +19,7 @@ from aevorex.db.models import (
     MarketFreshness,
     Property,
     PropertyAnalysis,
+    PropertyImage,
     PublishMarketState,
     PublishState,
     utc_now,
@@ -69,6 +70,31 @@ class Rig:
         self.writes.clear()
 
 
+def lens_factors(lens: str, price: int) -> dict[str, object]:
+    """Factors rich enough for every lens to state three numeric, favourable reasons."""
+    if lens == "motivated_seller":
+        return {"price_reduction_count": 2, "cumulative_price_cut_pct": 10.0,
+                "original_list_price": round(price / 0.9), "days_since_last_price_cut": 5,
+                "dom_vs_market_median": 3.0, "market_median_dom": 20.0}
+    if lens == "fix_flip":
+        return {"arv": round(price * 1.5), "max_allowable_offer": round(price * 1.1),
+                "projected_profit": 50_000, "cash_invested": 60_000, "roi_pct": 40.0,
+                "hold_months": 6.0, "valuation_confidence": 0.8}
+    if lens == "buy_hold":
+        return {"cap_rate_all_in_pct": 7.5, "all_in_basis": round(price * 1.1),
+                "gross_yield_pct": 9.0, "market_median_gross_yield_pct": 6.0,
+                "monthly_rent_estimate": 2500, "rent_method": "source_avm",
+                "monthly_cash_flow_after_debt": 300, "dscr": 1.3}
+    if lens == "str":
+        return {"in_season_monthly_rent": 4000, "monthly_rent_long_term": 3000,
+                "in_season_multiplier": 1.33, "season_months": 4.0, "net_annual_income": 20_000,
+                "net_yield_pct": 6.0, "all_in_basis": round(price * 1.1),
+                "uplift_vs_annual_lease_pct": 12.0}
+    return {"proxy_nightly_rate": 300, "proxy_occupancy": 0.5, "proxy_gross_annual_revenue": 54_750,
+            "proxy_net_annual_income": 20_000, "proxy_net_yield_pct": 6.0,
+            "all_in_basis": round(price * 1.1), "bedrooms": 3}
+
+
 def scored_property(position: int) -> tuple[Property, PropertyAnalysis]:
     score = 90.0 - position
     breakdown = {
@@ -82,7 +108,7 @@ def scored_property(position: int) -> tuple[Property, PropertyAnalysis]:
         id=uuid4(),
         primary_source="redfin",
         redfin_id=f"e6-{position}",
-        address=f"{position} Publisher Street",
+        address=f"{position + 100} publisher street",
         city="Orlando",
         state="FL",
         zip_code="32801",
@@ -90,6 +116,8 @@ def scored_property(position: int) -> tuple[Property, PropertyAnalysis]:
         bedrooms=3,
         bathrooms=2,
         sqft=1500,
+        property_type="Single Family Residential",
+        year_built=1990,
         days_on_market=position + 1,
         listing_status="Active",
         listing_status_normalized="active",
@@ -97,12 +125,20 @@ def scored_property(position: int) -> tuple[Property, PropertyAnalysis]:
         description="Charming home. Call Bob at 407-555-0100 or bob@example.com today.",
         last_seen_at=datetime(2026, 10, 3),
     )
+    item.property_images = [
+        PropertyImage(source="redfin", url=f"https://img.example.invalid/{position}/{index}.jpg",
+                      sort_order=index)
+        for index in range(6)
+    ]
     fields: dict[str, object] = {"property_id": item.id, "scoring_config_version": "v3",
                                  "computed_at": datetime(2026, 10, 3)}
     for lens in ("motivated_seller", "fix_flip", "buy_hold", "str", "airbnb"):
         fields.update({
             f"{lens}_score": score, f"{lens}_grade": "A", f"{lens}_percentile": 99.0 - position,
             f"{lens}_confidence": 1.0, f"{lens}_breakdown": breakdown,
+            f"{lens}_factors": lens_factors(lens, item.price),
+            f"{lens}_rationale": f"Grade A ({score:.0f}/100). Sale priced 10% under its original ask. "
+                                 "Key risks: none.",
         })
     analysis = PropertyAnalysis(**fields)
     return item, analysis

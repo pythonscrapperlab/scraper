@@ -2,114 +2,100 @@
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Sequence
 from typing import Any, cast
 
 from aevorex.db.models import MarketFreshness, Property
+from aevorex.publisher.reasons import (
+    MIN_NUMERIC_REASONS,
+    build_reasons,
+    build_summary,
+    headline,
+    number,
+)
 from aevorex.publisher.types import MarketDefinition
 from aevorex.scoring.recompose import recompose
+
+SNAPSHOT_VERSION = 3
+OPEN_COUNT = 3
+TEASER_COUNT = 5
+PHOTO_COUNT = 5
+MIN_PHOTOS = 3
+TOP_TIER_PERCENTILE = 90
+STRONG_TIER_PERCENTILE = 70
+
+_SUFFIXES = (
+    "st|street|ave|avenue|dr|drive|rd|road|blvd|boulevard|ter|terrace|ct|court|ln|lane|way|"
+    "pl|place|cir|circle|pkwy|parkway|trl|trail|loop|plz|sq|path|walk|pt|cv|xing"
+)
+# "State Rd 7" / "County Rd 2" end in a route number, not a unit.
+_ROUTE_PREFIXES = {"state", "county", "us", "sr", "cr", "highway", "route"}
+_BARE_UNIT = re.compile(rf"\b({_SUFFIXES})\s+((?:[a-z]\d+|\d+[a-z]?))$", re.IGNORECASE)
+# Not homes: cards show beds, baths and a renovation or rental case, which land and timeshares lack.
+_NOT_SHOWCASE_TYPES = {"vacant land", "timeshare"}
+_PROPERTY_TYPES = {
+    "single family residential": "Single-family",
+    "condo/co-op": "Condo",
+    "townhouse": "Townhouse",
+    "multi-family (2-4 unit)": "Multi-family (2–4 units)",
+    "multi-family (5+ unit)": "Multi-family (5+ units)",
+    "vacant land": "Vacant land",
+    "mobile/manufactured home": "Mobile home",
+}
 
 
 def format_address(address: str) -> str:
     """Format the stored street and unit without inventing missing address data."""
-    address = re.sub(r"\b(?:unit|apt|suite)\s+", "#", address, flags=re.I)
-    address = re.sub(r"\b(st|ave|dr|rd|blvd|ter|ct|ln|way|pl)\s+(\d+[a-z]?)$",
-                     r"\1 #\2", address, flags=re.I)
+    address = re.sub(r"\b(?:unit|apt|suite|ste)\s+", "#", address, flags=re.I)
+
+    def add_hash(match: re.Match[str]) -> str:
+        before = address[: match.start()].split()
+        if before and before[-1].lower() in _ROUTE_PREFIXES:
+            return match.group(0)
+        return f"{match.group(1)} #{match.group(2)}"
+
+    address = _BARE_UNIT.sub(add_hash, address)
     words = address.split()
     uppercase = {"n", "s", "e", "w", "ne", "nw", "se", "sw", "us"}
     formatted = " ".join(
         word.upper() if word.lower() in uppercase or word.startswith("#") else word.title()
         for word in words
     )
-    return re.sub(r"(\d)(St|Nd|Rd|Th)\b", lambda m: m[1] + m[2].lower(), formatted)
+    formatted = re.sub(r"(\d)(St|Nd|Rd|Th)\b", lambda m: m[1] + m[2].lower(), formatted)
+    return re.sub(r"\bMc([a-z])", lambda m: "Mc" + m[1].upper(), formatted)
 
 
-def _number(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+def full_address(item: Property) -> str | None:
+    """Street (with unit), city, state and zip, or None when any part is unusable.
+
+    Redfin hides some street addresses ("undisclosed address"); those listings also tend to be
+    merged records of several homes, so they are never shown.
+    """
+    street = format_address(str(item.address or "").strip())
+    city = str(item.city or "").strip().title()
+    state = str(item.state or "").strip().upper()
+    zip_code = str(item.zip_code or "").strip()
+    # A real street number: "00 Cinnabar Hills Rd" is an unaddressed parcel, not a home.
+    if not re.match(r"^(?!0+[A-Za-z]?\s)\d+[A-Za-z]?\s+\S", street) or "undisclosed" in street.lower():
         return None
-    return float(value) if math.isfinite(value) else None
+    if not city or len(state) != 2 or not re.fullmatch(r"\d{5}(-\d{4})?", zip_code):
+        return None
+    return f"{street}, {city}, {state} {zip_code}"
 
 
-def _headline(item: Property, lens: str, factors: dict[str, Any]) -> dict[str, Any]:
-    valuation = item.valuation
-    if lens == "motivated_seller":
-        return {"label": "Total price cut", "value": _number(factors.get("cumulative_price_cut_pct")),
-                "unit": "percent", "estimated": False}
-    if lens == "fix_flip":
-        mao = _number(factors.get("max_allowable_offer"))
-        arv = _number(factors.get("arv"))
-        if arv is None and valuation is not None:
-            arv = _number(valuation.arv)
-        return {"label": "Estimated ARV", "value": arv, "unit": "usd", "estimated": True,
-                "gap_to_max_offer": round(mao - item.price) if mao is not None else None}
-    if lens == "buy_hold":
-        # The lens underwrites all-in cost, not the generic valuation cap rate.
-        return {"label": "Estimated all-in cap rate", "value": _number(factors.get("cap_rate_all_in_pct")),
-                "unit": "percent", "estimated": True}
-    if lens == "str":
-        return {"label": "Estimated in-season monthly rent",
-                "value": _number(factors.get("in_season_monthly_rent")),
-                "unit": "usd_per_month", "estimated": True}
-    return {"label": "Estimated nightly revenue (proxy)",
-            "value": _number(factors.get("proxy_nightly_rate")),
-            "unit": "usd_per_night", "estimated": True}
+def photo_urls(item: Property) -> list[str]:
+    """The first five usable photos, in listing order, without repeats."""
+    ordered = sorted(item.property_images, key=lambda image: (image.sort_order or 0, image.url or ""))
+    urls = [image.url for image in ordered if image.url and image.url.startswith(("https://", "http://"))]
+    return list(dict.fromkeys(urls))[:PHOTO_COUNT]
 
 
-def _reasons(item: Property, lens: str, factors: dict[str, Any], city: str) -> list[str]:
-    """Public copy uses only allowlisted numeric facts, never free-text rationale."""
-    reasons: list[str] = []
-    cuts = _number(factors.get("price_reduction_count"))
-    if cuts and cuts > 0:
-        reasons.append(f"{cuts:g} price {'cut' if cuts == 1 else 'cuts'} in {item.days_on_market} days listed")
-    ratio = _number(factors.get("dom_vs_market_median"))
-    if ratio and ratio > 1:
-        reasons.append(f"Listed {item.days_on_market} days, {ratio:g}× the local market median")
-    discount = _number(factors.get("pct_below_estimated_value"))
-    if discount and discount > 0:
-        reasons.append(f"{discount:g}% below estimated value")
-    if lens == "motivated_seller":
-        for field, text in (
-            ("is_reo", "Listing marked REO"),
-            ("is_short_sale", "Listing marked short sale"),
-            ("is_probate_or_estate", "Estate or probate wording in listing"),
-            ("is_foreclosure", "Foreclosure wording in listing"),
-        ):
-            if getattr(item, field, False):
-                reasons.append(text)
-    elif lens == "fix_flip":
-        gap = _number(factors.get("offer_vs_asking_pct"))
-        if gap and gap > 0:
-            reasons.append(f"{gap:g}% below estimated max offer")
-        profit = _number(factors.get("projected_profit"))
-        if profit and profit > 0:
-            reasons.append(f"Estimated profit ${profit:,.0f} after modelled costs")
-        roi = _number(factors.get("roi_pct"))
-        if roi and roi > 0:
-            reasons.append(f"Estimated {roi:g}% levered return")
-        if not reasons:
-            # High relative rank does not imply profitable economics. Keep the
-            # signed underwriting gap visible rather than inventing upside.
-            gap = _number(factors.get("offer_vs_asking_pct"))
-            if gap is not None:
-                reasons.append(f"Asking price is {abs(gap):g}% {'below' if gap >= 0 else 'above'} estimated max offer")
-    elif lens == "buy_hold":
-        cap = _number(factors.get("cap_rate_all_in_pct"))
-        if cap and cap > 0:
-            reasons.append(f"Estimated {cap:g}% all-in cap rate")
-        yield_pct = _number(factors.get("gross_yield_pct"))
-        if yield_pct and yield_pct > 0:
-            reasons.append(f"Estimated {yield_pct:g}% gross rental yield")
-    elif lens == "str":
-        uplift = _number(factors.get("in_season_multiplier"))
-        if uplift and uplift > 1:
-            reasons.append(f"Estimated seasonal rent is {uplift:g}× the long-term baseline")
-    elif lens == "airbnb":
-        rate = _number(factors.get("proxy_nightly_rate"))
-        if rate and rate > 0:
-            reasons.append(f"Estimated nightly revenue proxy ${rate:,.0f}")
-    return reasons[:3]
+def _whole(value: Any) -> int | float | None:
+    value = number(value)
+    if value is None:
+        return None
+    return int(value) if value == int(value) else value
 
 
 def _price_band(price: int | None) -> dict[str, int] | None:
@@ -120,13 +106,51 @@ def _price_band(price: int | None) -> dict[str, int] | None:
     return {"low": low, "high": low + width - 1}
 
 
+def _tier(percentile: float) -> str:
+    if percentile >= TOP_TIER_PERCENTILE:
+        return "top"
+    return "strong" if percentile >= STRONG_TIER_PERCENTILE else "rest"
+
+
+def _open_property(
+    rank: int, pool_size: int, item: Property, analysis: Any, breakdown: dict[str, Any],
+    lens: str, address: str, photos: list[str], head: dict[str, Any], reasons: list[str],
+) -> dict[str, Any]:
+    rationale = getattr(analysis, f"{lens}_rationale") or breakdown.get("rationale")
+    raw_type = str(item.property_type or "").strip()
+    return {
+        "address": address,
+        "photos": photos,
+        "price": item.price,
+        "beds": item.bedrooms,
+        "baths": _whole(item.bathrooms),
+        "sqft": item.sqft,
+        "days_listed": item.days_on_market,
+        "property_type": _PROPERTY_TYPES.get(raw_type.lower(), raw_type or None),
+        "year_built": item.year_built,
+        "rank": rank,
+        "pool_size": pool_size,
+        "tier": _tier(float(getattr(analysis, f"{lens}_percentile"))),
+        "headline": head,
+        "reasons": reasons,
+        "summary": build_summary(rationale, str(item.state or "").upper()),
+    }
+
+
 def build_demo_snapshot(
     market: MarketDefinition,
     lens: str,
     properties: Sequence[Property],
     freshness: MarketFreshness,
 ) -> dict[str, Any]:
-    """Build exactly three full rows and five anonymous stubs for one lens."""
+    """Build three open properties and five locked teasers for one lens.
+
+    The pool is every active, scored listing in the city that passes the recomposition check,
+    ordered by this lens's score. Open properties and teasers are the highest-ranked members
+    of that pool that are also presentable (real price, days listed, a full street address and
+    at least three photos, three numeric reasons), so ``rank`` is an honest position in the
+    whole city pool.
+    """
     ranked: list[tuple[Property, Any, dict[str, Any]]] = []
     for item in properties:
         if item.delisted_at is not None or item.listing_status_normalized not in {"active", "new"}:
@@ -147,67 +171,54 @@ def build_demo_snapshot(
         ranked.append((item, analysis, breakdown))
     ranked.sort(
         key=lambda value: (
-            -float(getattr(value[1], f"{lens}_percentile")),
             -float(getattr(value[1], f"{lens}_score")),
+            -float(getattr(value[1], f"{lens}_percentile")),
             str(value[0].id),
         )
     )
     pool_size = len(ranked)
-    eligible = [
-        (rank, item, analysis, breakdown)
-        for rank, (item, analysis, breakdown) in enumerate(ranked, 1)
-        if item.price is not None and item.price > 0
-        and item.days_on_market is not None and item.days_on_market >= 0
-        and any(image.url and image.url.startswith(("https://", "http://"))
-                for image in item.property_images)
-        and _headline(item, lens, getattr(analysis, f"{lens}_factors") or {})["value"] is not None
-    ]
-    if len(eligible) < 8:
+
+    presentable: list[
+        tuple[int, Property, Any, dict[str, Any], str, list[str], dict[str, Any], list[str]]
+    ] = []
+    for rank, (item, analysis, breakdown) in enumerate(ranked, 1):
+        if not item.price or item.price <= 0 or item.price_is_placeholder:
+            continue
+        if item.days_on_market is None or item.days_on_market < 0:
+            continue
+        if str(item.property_type or "").strip().lower() in _NOT_SHOWCASE_TYPES:
+            continue
+        address, photos = full_address(item), photo_urls(item)
+        if address is None or len(photos) < MIN_PHOTOS:
+            continue
+        factors = getattr(analysis, f"{lens}_factors") or {}
+        head = headline(item, lens, factors)
+        if head is None:
+            continue
+        # A card needs real, favourable, numeric evidence behind it. A high rank without three
+        # such statements (e.g. a flip whose asking price is above our maximum offer) is not shown.
+        reasons = build_reasons(item, lens, factors, breakdown)
+        if sum(any(ch.isdigit() for ch in text) for text in reasons) < MIN_NUMERIC_REASONS:
+            continue
+        presentable.append((rank, item, analysis, breakdown, address, photos, head, reasons))
+        if len(presentable) == OPEN_COUNT + TEASER_COUNT:
+            break
+    if len(presentable) < OPEN_COUNT + TEASER_COUNT:
         raise ValueError("DemoSnapshotNeedsEightScoredRows")
 
-    full: list[dict[str, Any]] = []
-    for rank, item, analysis, breakdown in eligible[:3]:
-        percentile = float(getattr(analysis, f"{lens}_percentile"))
-        if percentile < 80:
-            raise ValueError("DemoSnapshotNeedsThreeTopOrStrongRows")
-        factors = getattr(analysis, f"{lens}_factors") or {}
-        components = breakdown.get("components", [])
-        labels = [
-            str(component.get("label"))
-            for component in components[:2]
-            if isinstance(component, dict) and component.get("label")
-        ]
-        full.append({
-            "address": format_address(str(item.address)),
-            "photo_url": next(image.url for image in sorted(
-                item.property_images, key=lambda image: (image.sort_order or 0, image.url)
-            ) if image.url and image.url.startswith(("https://", "http://"))),
-            "rank": rank,
-            "pool_size": pool_size,
-            "headline": _headline(item, lens, factors),
-            "reasons": _reasons(item, lens, factors, market.city),
-            "facts": {
-                "price": item.price,
-                "beds": item.bedrooms,
-                "baths": item.bathrooms,
-                "sqft": item.sqft,
-                "dom": item.days_on_market,
-            },
-            "score": getattr(analysis, f"{lens}_score"),
-            "grade": getattr(analysis, f"{lens}_grade"),
-            "percentile": percentile,
-            "tier": "top" if percentile >= 95 else "strong" if percentile >= 80 else "rest",
-            "component_labels": labels,
-        })
-
-    stubs: list[dict[str, Any]] = []
-    for _, item, _, _ in eligible[3:8]:
-        stubs.append({
-            "price_band": _price_band(cast(int | None, item.price)),
-            "dom": item.days_on_market,
-        })
+    full = [
+        _open_property(rank, pool_size, item, analysis, breakdown, lens, address, photos, head, reasons)
+        for rank, item, analysis, breakdown, address, photos, head, reasons in presentable[:OPEN_COUNT]
+    ]
+    if any(row["tier"] == "rest" for row in full):
+        raise ValueError("DemoSnapshotNeedsThreeTopOrStrongRows")
+    stubs = [
+        {"price_band": _price_band(cast(int | None, item.price)), "days_listed": item.days_on_market}
+        for _, item, *_ in presentable[OPEN_COUNT:]
+    ]
 
     return {
+        "version": SNAPSHOT_VERSION,
         "market": {"slug": market.slug, "city": market.city, "state": market.state},
         "lens": lens,
         "full": full,

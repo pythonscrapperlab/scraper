@@ -119,8 +119,10 @@ python main.py publisher wake
 
 `push` includes only search-snapshot rows linked to canonical local properties,
 retains delisted rows through the exact 30-day boundary, recomposes every score,
-and commits freshness last. Demo snapshots contain exactly three full rows and five
-redacted stubs per lens. A score mismatch is rejected and marks the run `partial`.
+and commits freshness last. Demo snapshots contain exactly three open properties and five
+locked teasers per lens. To rebuild only the snapshots from the local database (no scraping, no
+alerts), run `PYTHONPATH=. python scripts/publish_demo_snapshots.py out.json`, gate it with
+`python scripts/check_demo_snapshots.py out.json`, then add `--publish` to the first command. A score mismatch is rejected and marks the run `partial`.
 
 The size guard warns at 350 MiB, refuses a new market at 420 MiB, and sends the
 configured failure heartbeat at 450 MiB. `prune` previews by default; use `--apply`
