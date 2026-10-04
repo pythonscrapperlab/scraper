@@ -7,7 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import MetaData, Table
 
-from aevorex.publisher.markets import market_definition
+from aevorex.publisher.markets import demo_market_slugs, market_definition
 from aevorex.publisher.service import LENSES, Publisher
 from aevorex.publisher.snapshots import build_demo_snapshot
 
@@ -16,7 +16,10 @@ async def main() -> None:
     publisher = Publisher()
     try:
         rows = []
-        for slug in ("orlando-fl", "miami-fl", "tampa-fl", "vero-beach-fl", "san-jose-ca"):
+        slugs = sorted(demo_market_slugs())
+        if not slugs:
+            raise RuntimeError("NoDemoMarketsConfigured")
+        for slug in slugs:
             definition = market_definition(slug)
             properties, freshness = await publisher._load_local(definition)
             for lens in LENSES:
