@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import URL, func, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from aevorex.db.models import MarketFreshness, Property, PropertyAnalysis
+from aevorex.db.models import MarketFreshness, Property, PropertyAnalysis, PropertyImage
 from aevorex.publisher.remote import RemoteStore
 from aevorex.publisher.service import Publisher, apply_rejections, retained_delisted
 from aevorex.publisher.snapshots import build_demo_snapshot
@@ -60,14 +60,17 @@ def _scored_property(position: int) -> Property:
         bathrooms=2,
         sqft=1500,
         days_on_market=position + 1,
+        listing_status_normalized="active",
         last_seen_at=datetime(2026, 10, 3),
     )
+    item.property_images = [PropertyImage(url="https://example.com/photo.jpg", sort_order=0)]
     item.analysis = PropertyAnalysis(
         property_id=item.id,
         motivated_seller_score=score,
         motivated_seller_grade="A",
         motivated_seller_percentile=percentile,
         motivated_seller_confidence=1.0,
+        motivated_seller_factors={"cumulative_price_cut_pct": 10, "price_reduction_count": 2},
         motivated_seller_breakdown=breakdown,
         computed_at=datetime(2026, 10, 3),
     )
@@ -98,11 +101,35 @@ def test_demo_snapshot_has_exact_shape_and_redaction() -> None:
     )
     assert len(payload["full"]) == 3
     assert len(payload["stubs"]) == 5
-    assert set(payload["stubs"][0]) == {"tier", "price_band", "dom"}
+    assert set(payload["stubs"][0]) == {"price_band", "dom"}
+    assert payload["full"][0]["rank"] == 1
+    assert payload["full"][0]["pool_size"] == 8
     assert all(len(row["component_labels"]) == 2 for row in payload["full"])
     serialized = str(payload).casefold()
     for forbidden in ("agent", "broker", "phone", "breakdown"):
         assert forbidden not in serialized
+
+
+def test_demo_excludes_incomplete_and_inactive_rows_without_changing_pool_rank() -> None:
+    market = MarketDefinition(slug="orlando-fl", city="Orlando", state="FL",
+                              region_id="13655", timezone="America/New_York", is_demo=True)
+    freshness = MarketFreshness(slug=market.slug, check_status="failed")
+    rows = [_scored_property(position) for position in range(12)]
+    rows[0].listing_status_normalized = "sold"
+    rows[1].property_images = []
+    rows[2].price = None
+    rows[3].days_on_market = None
+    payload = build_demo_snapshot(market, "motivated_seller", rows, freshness)
+    assert payload["full"][0]["rank"] == 4
+    assert payload["full"][0]["pool_size"] == 11
+    assert payload["full"][0]["headline"]["value"] == 10
+    assert payload["full"][0]["reasons"] == ["2 price cuts in 5 days listed"]
+
+
+def test_address_formatting_preserves_direction_and_unit() -> None:
+    from aevorex.publisher.snapshots import format_address
+    assert format_address("2627 s bayshore dr unit 1202") == "2627 S Bayshore Dr #1202"
+    assert format_address("1075 nw 100th st") == "1075 NW 100th St"
 
 
 def test_recompose_rejection_marks_run_partial() -> None:
